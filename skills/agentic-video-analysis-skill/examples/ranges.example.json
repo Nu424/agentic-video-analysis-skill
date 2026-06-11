@@ -1,0 +1,24 @@
+{
+  "video": "video.mp4",
+  "output_dir": "output/agentic_sessions/example/candidates",
+  "defaults": {
+    "fps": 5,
+    "pad": 2,
+    "frames_per_tile": 12
+  },
+  "ranges": [
+    {
+      "label": "candidate_a",
+      "start": 38,
+      "end": 46,
+      "priority": "high"
+    },
+    {
+      "label": "candidate_b",
+      "start": 49,
+      "end": 53.5,
+      "priority": "high"
+    }
+  ],
+  "summary_output": "output/agentic_sessions/example/candidates/batch_summary.json"
+}
