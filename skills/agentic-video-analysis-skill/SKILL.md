@@ -3,6 +3,7 @@ name: agentic-video-analysis-skill
 description: |
   動画をフレームタイル化し、aitool recognize-imageで反復的に解析するためのスキル。
   動画解析、見どころ抽出、ハイライト候補探索、ゲーム実況分析、エージェンティックな動画理解を行うときに使用する。
+---
 
 # Agentic Video Analysis
 
