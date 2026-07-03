@@ -5,7 +5,8 @@
 ## できること
 
 - 動画全体の概要把握と見どころ候補の列挙
-- 候補範囲の中fps確認による事実の確定
+- 候補範囲の中fps確認による事実の確定（仮説注入・JSON構造化出力）
+- 文字・細部が読めない箇所の特定時刻フル解像度ズーム確認（任意）
 - 境界が曖昧な箇所の高fps精密確認（任意）
 - 後段の動画構成エージェントへ渡すための `final.md` 出力
 
@@ -65,6 +66,7 @@ aitool が要求する `OPENROUTER_API_KEY` は `.env` または `~/.env.global`
 output/agentic_sessions/<video_stem>_<timestamp>/
   overview/      # 全体把握のタイルと解析結果
   candidates/    # 候補範囲のタイル・config・解析結果
+  zooms/         # ズーム（特定時刻フル解像度）の確認（任意）
   refinements/   # 精密確認（任意）
   notes/         # 候補一覧などの中間メモ
   final.md       # 最終まとめ
@@ -99,10 +101,10 @@ python .agents/skills/agentic-video-analysis-skill/scripts/analyze_tile_manifest
 
 | 役割 | スクリプト |
 | --- | --- |
-| タイル化（単一範囲 / config複数範囲） | `scripts/tile_video_frames.py` |
-| 解析（単一 / 複数manifest / summary一括） | `scripts/analyze_tile_manifest.py` |
+| タイル化（単一範囲 / config複数範囲 / zoom） | `scripts/tile_video_frames.py` |
+| 解析（単一 / 複数manifest / summary一括 / 並列 / 分割） | `scripts/analyze_tile_manifest.py` |
 
-各フレームには `F<index> t=<秒>s` のラベルが付き、解析結果はセルラベルを根拠に記述します。manifest 内の全タイルは **1回の API 呼び出し**でまとめて渡されます。
+各フレームには `F<index> t=<秒>s` のラベル（600秒超は `m:ss.s`）が付き、解析結果はセルラベルを根拠に記述します。manifest 内の全タイルは **原則1回の API 呼び出し**でまとめて渡されます（`--max-tiles-per-call` 超過時のみ時系列で分割）。共通処理は `scripts/common.py` に集約しています。
 
 ## 実行の流れ
 
@@ -110,6 +112,8 @@ python .agents/skills/agentic-video-analysis-skill/scripts/analyze_tile_manifest
 Step 1 全体把握    動画全体を低fps(0.5)でタイル化 → overview解析 → 候補を多めに列挙
         │
 Step 2 候補確認    候補をconfig化 → 一括タイル化(中fps) → detail解析 → 事実を確定
+        │
+Step 2.5 ズーム    文字・細部が読めない候補だけ特定時刻をフル解像度で確認 → zoom解析（任意）
         │
 Step 3 精密確認    境界が曖昧な候補だけ高fpsで再タイル化 → refine解析（任意）
         │
@@ -122,8 +126,10 @@ Step 4 最終出力    確定した見どころ候補だけを final.md にま�
 
 | 段階 | fps | 目的 |
 | --- | --- | --- |
+| 長尺の章立て（10分超） | 0.1〜0.2 | 大きな区切りの把握 |
 | Step 1 全体把握 | 0.5〜1 | 概要と候補列挙 |
 | Step 2 候補確認 | 3〜5 | 出来事の存在確認 |
+| Step 2.5 ズーム | 特定時刻のみ・フル解像度 | 文字・細部の判読 |
 | Step 3 精密確認 | 8〜10 | 開始・終了秒の詰め |
 
 ### 原則
@@ -137,8 +143,8 @@ Step 4 最終出力    確定した見どころ候補だけを final.md にま�
 ```text
 skills/agentic-video-analysis-skill/
   SKILL.md              # エージェント向け手順書
-  scripts/              # タイル化・解析CLI
-  prompts/              # overview / detail / refine プロンプト
+  scripts/              # common.py + タイル化・解析CLI
+  prompts/              # overview / detail / zoom / refine プロンプト
   examples/             # 候補範囲定義の雛形
 ```
 
