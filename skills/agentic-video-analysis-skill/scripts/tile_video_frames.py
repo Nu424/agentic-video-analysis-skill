@@ -43,6 +43,7 @@ DEFAULT_TILE_WIDTH = 1600
 DEFAULT_TILE_HEIGHT = 900
 DEFAULT_EXTRACT_WIDTH = 640
 DEFAULT_QUALITY = 80
+DEFAULT_ZOOM_QUALITY = 90
 WARN_FRAMES_PER_TILE = 16
 # 600秒を超える範囲では m:ss 形式のタイムスタンプラベルを使う
 LONG_FORM_THRESHOLD_SEC = 600.0
@@ -63,6 +64,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument("--end", type=float, default=None, help="終了秒。省略時は動画末尾")
     parser.add_argument("--pad", type=float, default=0.0, help="開始・終了の前後に足す秒数")
     parser.add_argument("--fps", type=float, default=1.0, help="1秒あたりの抽出枚数")
+    parser.add_argument(
+        "--timestamps",
+        default=None,
+        help="ズームモード: 抽出する時刻をカンマ区切りで指定（例 38.5,40.2）。--start/--end/--fps と排他",
+    )
     parser.add_argument("-o", "--output", default=None, help="出力画像パス、または複数タイル時のベースパス")
     parser.add_argument(
         "--metadata-output",
@@ -88,16 +94,16 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--width",
         type=int,
-        default=DEFAULT_EXTRACT_WIDTH,
-        help="ffmpeg抽出時のリサイズ幅px。高さはアスペクト比維持",
+        default=None,
+        help=f"ffmpeg抽出時のリサイズ幅px（既定 {DEFAULT_EXTRACT_WIDTH}）。zoomモードでは未指定でフル解像度",
     )
     parser.add_argument("--label-height", type=int, default=28, help="各セル下部ラベルの高さpx")
     parser.add_argument("--gap", type=int, default=2, help="セル間の隙間px")
     parser.add_argument(
         "--quality",
         type=int,
-        default=DEFAULT_QUALITY,
-        help=f"出力JPEG品質 1-95（既定: {DEFAULT_QUALITY}）",
+        default=None,
+        help=f"出力JPEG品質 1-95（タイル既定 {DEFAULT_QUALITY} / zoom既定 {DEFAULT_ZOOM_QUALITY}）",
     )
     parser.add_argument(
         "--ffmpeg-quality",
@@ -173,6 +179,12 @@ def resolve_output_layout(output_path: Path, tile_count: int) -> dict[str, Any]:
 
 
 def validate_options(options: argparse.Namespace) -> dict[str, Any]:
+    # タイル化モードでの既定値解決（None は zoom モード判別のための未指定マーカ）
+    if options.width is None:
+        options.width = DEFAULT_EXTRACT_WIDTH
+    if options.quality is None:
+        options.quality = DEFAULT_QUALITY
+
     video_path = Path(options.video).expanduser().resolve()
     if not video_path.exists():
         raise RuntimeError(f"動画ファイルが見つかりません: {video_path}")
@@ -574,6 +586,188 @@ def tile_one_range(options: argparse.Namespace) -> dict[str, Any]:
     }
 
 
+# --- zoom（特定時刻をフル解像度で1枚ずつ）モード -----------------------------
+
+
+def parse_timestamps(spec: str) -> list[float]:
+    values: list[float] = []
+    for token in spec.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        try:
+            values.append(float(token))
+        except ValueError as exc:
+            raise RuntimeError(f"--timestamps の値が不正です: {token!r}") from exc
+    if not values:
+        raise RuntimeError("--timestamps に有効な時刻がありません")
+    if any(value < 0 for value in values):
+        raise RuntimeError("--timestamps は 0 以上を指定してください")
+    return values
+
+
+def extract_single_frame(
+    video_path: Path,
+    out_path: Path,
+    timestamp_sec: float,
+    extract_width: int | None,
+    ffmpeg_quality: int,
+) -> None:
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    args = [
+        "ffmpeg",
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        "-y",
+        "-ss",
+        f"{timestamp_sec:.6f}",
+        "-i",
+        str(video_path),
+        "-frames:v",
+        "1",
+    ]
+    if extract_width:
+        args.extend(["-vf", f"scale={extract_width}:-2"])
+    args.extend(["-q:v", str(ffmpeg_quality), str(out_path)])
+    run_command(args, "ffmpeg (zoom)")
+    if not out_path.exists():
+        raise RuntimeError(f"フレーム抽出に失敗しました: t={timestamp_sec}s")
+
+
+def render_zoom_image(
+    frame_path: Path,
+    frame_index: int,
+    timestamp_sec: float,
+    label_height: int,
+    long_form_labels: bool,
+) -> tuple[Image.Image, dict[str, Any]]:
+    with Image.open(frame_path) as frame:
+        frame_rgb = frame.convert("RGB")
+        width, height = frame_rgb.size
+        canvas = Image.new("RGB", (width, height + label_height), "#1a1a1a")
+        canvas.paste(frame_rgb, (0, 0))
+
+    draw = ImageDraw.Draw(canvas)
+    font = load_font(max(12, min(28, round(label_height * 0.6))))
+    draw.rectangle((0, height, width, height + label_height), fill=(0, 0, 0))
+    draw.text(
+        (6, height + max(1, round(label_height * 0.18))),
+        f"F{frame_index} t={format_timestamp(timestamp_sec, long_form_labels)}",
+        fill=(255, 255, 255),
+        font=font,
+    )
+    cell = {
+        "frame_index": frame_index,
+        "timestamp_sec": round(timestamp_sec, 6),
+        "filename": frame_path.name,
+        "row": 0,
+        "col": 0,
+    }
+    return canvas, {"cell_width": width, "cell_height": height, "cell": cell}
+
+
+def default_zoom_output_path(video_path: Path, timestamps: list[float]) -> Path:
+    stem = video_path.stem
+    first = format_float_for_path(timestamps[0])
+    return Path("output") / "agentic_tiles" / f"{stem}_zoom_{first}.jpg"
+
+
+def tile_zoom(options: argparse.Namespace, timestamps: list[float]) -> dict[str, Any]:
+    """特定時刻をフル解像度で1枚ずつ抽出し、zoom manifest を書き出す。"""
+    video_path = Path(options.video).expanduser().resolve()
+    if not video_path.exists():
+        raise RuntimeError(f"動画ファイルが見つかりません: {video_path}")
+
+    # zoom の既定: リサイズなし・品質90（明示指定があれば尊重）
+    extract_width = options.width  # None ならフル解像度
+    quality = options.quality if options.quality is not None else DEFAULT_ZOOM_QUALITY
+
+    duration_sec = probe_duration_sec(video_path)
+    source_width, source_height = probe_video_size(video_path)
+    for ts in timestamps:
+        if ts >= duration_sec:
+            raise RuntimeError(f"--timestamps の {ts}s が動画長 {duration_sec:.3f}s を超えています")
+
+    output_path = (
+        Path(options.output).expanduser().resolve()
+        if options.output
+        else default_zoom_output_path(video_path, timestamps).resolve()
+    )
+    layout = resolve_output_layout(output_path, len(timestamps))
+    manifest_path = (
+        Path(options.metadata_output).expanduser().resolve()
+        if options.metadata_output
+        else layout["manifest_path"]
+    )
+    long_form_labels = max(timestamps) >= LONG_FORM_THRESHOLD_SEC
+
+    temp_root = Path(tempfile.mkdtemp(prefix="agentic_video_zoom_"))
+    print(f"入力動画: {video_path}")
+    print(f"ズーム時刻: {', '.join(f'{ts:g}' for ts in timestamps)}")
+
+    tile_entries: list[dict[str, Any]] = []
+    try:
+        for index, ts in enumerate(timestamps):
+            raw_frame = temp_root / f"zoom_{index:03d}.jpg"
+            extract_single_frame(video_path, raw_frame, ts, extract_width, options.ffmpeg_quality)
+            image, meta = render_zoom_image(raw_frame, index, ts, options.label_height, long_form_labels)
+            tile_path = layout["tile_paths"][index]
+            tile_path.parent.mkdir(parents=True, exist_ok=True)
+            image.save(tile_path, quality=quality)
+
+            tile_entries.append(
+                {
+                    "tile_index": index,
+                    "filename": tile_path.name,
+                    "path": str(tile_path),
+                    "start_frame": index,
+                    "end_frame": index,
+                    "start_timestamp_sec": round(ts, 6),
+                    "end_timestamp_sec": round(ts, 6),
+                    "frame_count": 1,
+                    "grid": {"cols": 1, "rows": 1},
+                    "cell_width": meta["cell_width"],
+                    "cell_height": meta["cell_height"],
+                    "tile_width": image.width,
+                    "tile_height": image.height,
+                    "cells": [meta["cell"]],
+                }
+            )
+            print(f"  ズーム {index}: t={ts:g}s -> {tile_path}")
+
+        context = {
+            "video_path": video_path,
+            "duration_sec": duration_sec,
+            "source_width": source_width,
+            "source_height": source_height,
+            "requested_start_sec": min(timestamps),
+            "requested_end_sec": max(timestamps),
+            "start_sec": min(timestamps),
+            "end_sec": max(timestamps),
+        }
+        # build_manifest 用に options の派生値を整える
+        zoom_options = argparse.Namespace(**vars(options))
+        zoom_options.width = extract_width
+        zoom_options.fps = None
+        manifest = build_manifest(
+            context, zoom_options, tile_entries, None, approach="agentic_video_frame_zoom"
+        )
+        manifest["extraction"]["timestamps"] = [round(ts, 6) for ts in timestamps]
+        manifest_path.parent.mkdir(parents=True, exist_ok=True)
+        write_json(manifest_path, manifest)
+        print(f"manifest:   {manifest_path}")
+    finally:
+        shutil.rmtree(temp_root, ignore_errors=True)
+
+    return {
+        "output": str(output_path),
+        "manifest_path": str(manifest_path),
+        "tile_count": len(timestamps),
+        "frame_count": len(timestamps),
+    }
+
+
 # --- config（複数範囲一括）モード ---------------------------------------------
 
 
@@ -644,6 +838,8 @@ def merge_range_entries(ranges: list[dict[str, Any]], threshold: float) -> list[
 def merge_defaults(config: dict[str, Any], range_entry: dict[str, Any]) -> dict[str, Any]:
     defaults = config.get("defaults", {})
     merged = {**defaults, **range_entry}
+    if merged.get("timestamps"):
+        return merged  # zoom range は start/end 不要
     for key in ("start", "end"):
         if key not in merged:
             raise RuntimeError(f"range に {key} が必要です: {merged}")
@@ -658,9 +854,13 @@ def resolve_output_path(config: dict[str, Any], merged: dict[str, Any]) -> Path:
             output_dir = Path(config["output_dir"]).expanduser()
         else:
             output_dir = Path("output") / "agentic_tiles"
-        label = merged.get("label") or f"{merged['start']}_{merged['end']}"
-        fps = merged.get("fps", 1)
-        output_path = output_dir / f"{label}_fps{fps}.jpg"
+        if merged.get("timestamps"):
+            label = merged.get("label") or "zoom"
+            output_path = output_dir / f"{label}_zoom.jpg"
+        else:
+            label = merged.get("label") or f"{merged['start']}_{merged['end']}"
+            fps = merged.get("fps", 1)
+            output_path = output_dir / f"{label}_fps{fps}.jpg"
     if not output_path.is_absolute():
         output_path = (Path.cwd() / output_path).resolve()
     return output_path
@@ -686,6 +886,16 @@ _RANGE_OPTION_KEYS = (
 )
 
 
+def parse_timestamps_value(value: Any) -> list[float]:
+    """config の timestamps（配列 or カンマ区切り文字列）を float リストにする。"""
+    if isinstance(value, str):
+        return parse_timestamps(value)
+    values = [float(item) for item in value]
+    if not values:
+        raise RuntimeError("timestamps が空です")
+    return values
+
+
 def make_range_options(
     base: argparse.Namespace,
     video_path: Path,
@@ -695,9 +905,10 @@ def make_range_options(
     options = argparse.Namespace(**vars(base))
     options.config = None
     options.video = str(video_path)
-    options.start = float(merged["start"])
-    options.end = float(merged["end"])
     options.output = str(output_path)
+    if not merged.get("timestamps"):
+        options.start = float(merged["start"])
+        options.end = float(merged["end"])
     for key in _RANGE_OPTION_KEYS:
         if key in merged and merged[key] is not None:
             setattr(options, key, merged[key])
@@ -721,39 +932,47 @@ def run_config_mode(options: argparse.Namespace) -> int:
         output_path = resolve_output_path(config, merged)
         label = merged.get("label")
         note = merged.get("note")
+        is_zoom = bool(merged.get("timestamps"))
+        timestamps = parse_timestamps_value(merged["timestamps"]) if is_zoom else None
+        span_desc = (
+            f"timestamps={','.join(f'{ts:g}' for ts in timestamps)}"
+            if is_zoom
+            else f"{merged['start']}-{merged['end']}s"
+        )
 
         if options.dry_run:
-            print(
-                f"[{index}] {label or ''} start={merged['start']} end={merged['end']}"
-                f" fps={merged.get('fps', options.fps)} -> {output_path}"
-                + (f" note={note}" if note else "")
-            )
+            print(f"[{index}] {label or ''} {span_desc} -> {output_path}" + (f" note={note}" if note else ""))
             results.append(
                 {
                     "index": index,
                     "label": label,
                     "note": note,
                     "status": "dry_run",
+                    "mode": "zoom" if is_zoom else "tile",
                     "output": str(output_path),
-                    "start_sec": merged["start"],
-                    "end_sec": merged["end"],
+                    "start_sec": min(timestamps) if is_zoom else merged["start"],
+                    "end_sec": max(timestamps) if is_zoom else merged["end"],
                 }
             )
             continue
 
-        print(f"[{index}] {label or ''} {merged['start']}-{merged['end']}s -> {output_path}")
+        print(f"[{index}] {label or ''} {span_desc} -> {output_path}")
         range_options = make_range_options(options, video_path, merged, output_path)
-        result = tile_one_range(range_options)
+        if is_zoom:
+            result = tile_zoom(range_options, timestamps)
+        else:
+            result = tile_one_range(range_options)
         results.append(
             {
                 "index": index,
                 "label": label,
                 "note": note,
                 "status": "ok",
+                "mode": "zoom" if is_zoom else "tile",
                 "output": result["output"],
                 "manifest_path": result["manifest_path"],
-                "start_sec": merged["start"],
-                "end_sec": merged["end"],
+                "start_sec": min(timestamps) if is_zoom else merged["start"],
+                "end_sec": max(timestamps) if is_zoom else merged["end"],
             }
         )
 
@@ -777,6 +996,11 @@ def main(argv: list[str]) -> int:
     options = parse_args(argv)
     if options.config:
         return run_config_mode(options)
+    if options.timestamps:
+        if not options.video:
+            raise RuntimeError("--timestamps には --video が必要です")
+        tile_zoom(options, parse_timestamps(options.timestamps))
+        return 0
     if not options.video:
         raise RuntimeError("--video または --config を指定してください")
     tile_one_range(options)
