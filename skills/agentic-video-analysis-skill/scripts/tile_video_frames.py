@@ -16,10 +16,8 @@
 from __future__ import annotations
 
 import argparse
-import json
 import math
 import shutil
-import subprocess
 import sys
 import tempfile
 import warnings
@@ -27,13 +25,27 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageDraw
+
+from common import (
+    format_float_for_path,
+    format_timestamp,
+    load_font,
+    probe_duration_sec,
+    probe_video_size,
+    read_json,
+    run_command,
+    write_json,
+)
 
 DEFAULT_FRAMES_PER_TILE = 12
-DEFAULT_TILE_WIDTH = 1920
-DEFAULT_TILE_HEIGHT = 1080
+DEFAULT_TILE_WIDTH = 1600
+DEFAULT_TILE_HEIGHT = 900
 DEFAULT_EXTRACT_WIDTH = 640
+DEFAULT_QUALITY = 80
 WARN_FRAMES_PER_TILE = 16
+# 600秒を超える範囲では m:ss 形式のタイムスタンプラベルを使う
+LONG_FORM_THRESHOLD_SEC = 600.0
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -81,7 +93,12 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     )
     parser.add_argument("--label-height", type=int, default=28, help="各セル下部ラベルの高さpx")
     parser.add_argument("--gap", type=int, default=2, help="セル間の隙間px")
-    parser.add_argument("--quality", type=int, default=90, help="出力JPEG品質 1-95")
+    parser.add_argument(
+        "--quality",
+        type=int,
+        default=DEFAULT_QUALITY,
+        help=f"出力JPEG品質 1-95（既定: {DEFAULT_QUALITY}）",
+    )
     parser.add_argument(
         "--ffmpeg-quality",
         type=int,
@@ -115,76 +132,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="config モードで処理予定の範囲を表示するだけで実行しない",
     )
     return parser.parse_args(argv)
-
-
-def run_command(args: list[str], label: str) -> str:
-    try:
-        result = subprocess.run(
-            args,
-            check=False,
-            capture_output=True,
-            encoding="utf-8",
-        )
-    except FileNotFoundError as exc:
-        raise RuntimeError(f"{args[0]} が見つかりません。ffmpeg/ffprobeをインストールしてください") from exc
-
-    if result.returncode != 0:
-        stderr = result.stderr.strip()
-        raise RuntimeError(f"{label} に失敗しました (exit {result.returncode}): {stderr}")
-
-    return result.stdout.strip()
-
-
-def probe_duration_sec(video_path: Path) -> float:
-    output = run_command(
-        [
-            "ffprobe",
-            "-v",
-            "error",
-            "-show_entries",
-            "format=duration",
-            "-of",
-            "default=noprint_wrappers=1:nokey=1",
-            str(video_path),
-        ],
-        "ffprobe",
-    )
-    try:
-        duration = float(output)
-    except ValueError as exc:
-        raise RuntimeError(f"動画の長さを取得できませんでした: {video_path}") from exc
-
-    if not math.isfinite(duration) or duration <= 0:
-        raise RuntimeError(f"動画の長さが不正です: {duration}")
-    return duration
-
-
-def probe_video_size(video_path: Path) -> tuple[int, int]:
-    output = run_command(
-        [
-            "ffprobe",
-            "-v",
-            "error",
-            "-select_streams",
-            "v:0",
-            "-show_entries",
-            "stream=width,height",
-            "-of",
-            "csv=p=0:s=x",
-            str(video_path),
-        ],
-        "ffprobe (size)",
-    )
-    try:
-        width, height = [int(value) for value in output.split("x")]
-    except ValueError as exc:
-        raise RuntimeError(f"動画サイズを取得できませんでした: {output}") from exc
-    return width, height
-
-
-def format_float_for_path(value: float) -> str:
-    text = f"{value:.3f}".rstrip("0").rstrip(".")
-    return text.replace(".", "_")
 
 
 def default_output_path(video_path: Path, start_sec: float, end_sec: float, fps: float) -> Path:
@@ -386,21 +333,6 @@ def warn_if_needed(frame_count: int, frames_per_tile: int, quiet: bool) -> None:
     )
 
 
-def load_font(size: int) -> ImageFont.ImageFont:
-    candidates = [
-        "arial.ttf",
-        "C:/Windows/Fonts/arial.ttf",
-        "/Library/Fonts/Arial.ttf",
-        "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
-    ]
-    for candidate in candidates:
-        try:
-            return ImageFont.truetype(candidate, size=size)
-        except OSError:
-            continue
-    return ImageFont.load_default()
-
-
 def render_tile(
     frames_chunk: list[Path],
     range_start_sec: float,
@@ -413,6 +345,7 @@ def render_tile(
     frames_per_tile: int,
     tile_width: int,
     tile_height: int,
+    long_form_labels: bool = False,
 ) -> tuple[Image.Image, dict[str, Any]]:
     with Image.open(frames_chunk[0]) as sample:
         source_width, source_height = sample.size
@@ -459,7 +392,7 @@ def render_tile(
         )
         draw.text(
             (left + 6, label_top + max(1, round(label_height * 0.18))),
-            f"F{frame_index} t={timestamp_sec:.1f}s",
+            f"F{frame_index} t={format_timestamp(timestamp_sec, long_form_labels)}",
             fill=(255, 255, 255),
             font=font,
         )
@@ -487,53 +420,23 @@ def render_tile(
     return tile, metadata
 
 
-def build_single_metadata(
-    context: dict[str, Any],
-    options: argparse.Namespace,
-    tile_entry: dict[str, Any],
-    temp_frames_dir: Path | None,
-) -> dict[str, Any]:
-    return {
-        "version": 1,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        "approach": "agentic_video_frame_tile",
-        "source": {
-            "video_path": str(context["video_path"]),
-            "duration_sec": context["duration_sec"],
-            "width": context["source_width"],
-            "height": context["source_height"],
-        },
-        "extraction": {
-            "requested_start_sec": context["requested_start_sec"],
-            "requested_end_sec": context["requested_end_sec"],
-            "start_sec": context["start_sec"],
-            "end_sec": context["end_sec"],
-            "duration_sec": context["end_sec"] - context["start_sec"],
-            "pad_sec": options.pad,
-            "fps": options.fps,
-            "extract_width": options.width,
-            "kept_frames_dir": str(temp_frames_dir) if temp_frames_dir else None,
-        },
-        "tiling": {
-            "frames_per_tile": options.frames_per_tile,
-            "tile_count": 1,
-            **{key: tile_entry[key] for key in tile_entry if key != "filename"},
-        },
-        "tiles": [tile_entry],
-    }
-
-
-def build_multi_metadata(
+def build_manifest(
     context: dict[str, Any],
     options: argparse.Namespace,
     tile_entries: list[dict[str, Any]],
     temp_frames_dir: Path | None,
+    approach: str = "agentic_video_frame_tiles",
 ) -> dict[str, Any]:
+    """常に multi 形（tiles 配列）で manifest を組み立てる（version 2）。
+
+    単一タイルでも tiles 配列1件の形で出力する。消費側 (analyze_tile_manifest.py)
+    は tiles と extraction しか読まないため、この統一による実影響はない。
+    """
     first = tile_entries[0]
     return {
-        "version": 1,
+        "version": 2,
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "approach": "agentic_video_frame_tiles",
+        "approach": approach,
         "source": {
             "video_path": str(context["video_path"]),
             "duration_sec": context["duration_sec"],
@@ -600,6 +503,7 @@ def tile_one_range(options: argparse.Namespace) -> dict[str, Any]:
         chunks = chunk_frames(frames, options.frames_per_tile)
         layout = resolve_output_layout(output_path, len(chunks))
         manifest_path = metadata_output_override or layout["manifest_path"]
+        long_form_labels = context["end_sec"] >= LONG_FORM_THRESHOLD_SEC
 
         tile_entries: list[dict[str, Any]] = []
         for tile_index, chunk in enumerate(chunks):
@@ -615,6 +519,7 @@ def tile_one_range(options: argparse.Namespace) -> dict[str, Any]:
                 options.frames_per_tile,
                 options.tile_width,
                 options.tile_height,
+                long_form_labels,
             )
             tile_path = layout["tile_paths"][tile_index]
             tile_path.parent.mkdir(parents=True, exist_ok=True)
@@ -651,11 +556,8 @@ def tile_one_range(options: argparse.Namespace) -> dict[str, Any]:
             print(f"           -> {tile_path}")
 
         manifest_path.parent.mkdir(parents=True, exist_ok=True)
-        if layout["mode"] == "single":
-            metadata = build_single_metadata(context, options, tile_entries[0], kept_frames_dir)
-        else:
-            metadata = build_multi_metadata(context, options, tile_entries, kept_frames_dir)
-        manifest_path.write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
+        metadata = build_manifest(context, options, tile_entries, kept_frames_dir)
+        write_json(manifest_path, metadata)
 
         print(f"フレーム数: {len(frames)}")
         print(f"タイル数:   {len(chunks)}")
@@ -676,7 +578,7 @@ def tile_one_range(options: argparse.Namespace) -> dict[str, Any]:
 
 
 def load_config(config_path: Path) -> dict[str, Any]:
-    config = json.loads(config_path.read_text(encoding="utf-8"))
+    config = read_json(config_path)
     if "video" not in config:
         raise RuntimeError("config に video が必要です")
     if not config.get("ranges"):
@@ -724,6 +626,9 @@ def merge_range_entries(ranges: list[dict[str, Any]], threshold: float) -> list[
             labels = [part for part in [previous.get("label"), current.get("label")] if part]
             if labels:
                 previous["label"] = "_".join(dict.fromkeys(labels))
+            notes = [part for part in [previous.get("note"), current.get("note")] if part]
+            if notes:
+                previous["note"] = " / ".join(dict.fromkeys(notes))
             previous["needs_followup"] = previous.get("needs_followup") or current.get("needs_followup")
             priority_rank = {"high": 3, "medium": 2, "low": 1}
             previous["priority"] = max(
@@ -815,16 +720,19 @@ def run_config_mode(options: argparse.Namespace) -> int:
         merged = merge_defaults(config, range_entry)
         output_path = resolve_output_path(config, merged)
         label = merged.get("label")
+        note = merged.get("note")
 
         if options.dry_run:
             print(
                 f"[{index}] {label or ''} start={merged['start']} end={merged['end']}"
                 f" fps={merged.get('fps', options.fps)} -> {output_path}"
+                + (f" note={note}" if note else "")
             )
             results.append(
                 {
                     "index": index,
                     "label": label,
+                    "note": note,
                     "status": "dry_run",
                     "output": str(output_path),
                     "start_sec": merged["start"],
@@ -840,6 +748,7 @@ def run_config_mode(options: argparse.Namespace) -> int:
             {
                 "index": index,
                 "label": label,
+                "note": note,
                 "status": "ok",
                 "output": result["output"],
                 "manifest_path": result["manifest_path"],
@@ -852,17 +761,13 @@ def run_config_mode(options: argparse.Namespace) -> int:
     if not summary_path.is_absolute():
         summary_path = (Path.cwd() / summary_path).resolve()
     summary_path.parent.mkdir(parents=True, exist_ok=True)
-    summary_path.write_text(
-        json.dumps(
-            {
-                "video": str(video_path),
-                "config": str(config_path),
-                "results": results,
-            },
-            ensure_ascii=False,
-            indent=2,
-        ),
-        encoding="utf-8",
+    write_json(
+        summary_path,
+        {
+            "video": str(video_path),
+            "config": str(config_path),
+            "results": results,
+        },
     )
     print(f"summary: {summary_path}")
     return 0
