@@ -11,7 +11,8 @@
       "label": "candidate_a",
       "start": 38,
       "end": 46,
-      "priority": "high"
+      "priority": "high",
+      "note": "全体把握では38s付近で大きな画面変化。何が起きたか確認したい（仮説）"
     },
     {
       "label": "candidate_b",
