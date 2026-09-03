@@ -1,6 +1,7 @@
 #!/usr/bin/env python
-"""tile_video_frames.py / analyze_tile_manifest.py が共有するユーティリティ。
+"""avs パッケージ全体が共有するユーティリティ。
 
+- 標準出力のUTF-8化 (`configure_utf8_stdout`)
 - subprocess 実行とエラー整形 (`run_command`)
 - ffprobe による動画長・サイズ取得 (`probe_duration_sec` / `probe_video_size`)
 - パス用の float 整形 (`format_float_for_path`)
@@ -14,10 +15,27 @@ from __future__ import annotations
 import json
 import math
 import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
 from PIL import ImageFont
+
+
+def configure_utf8_stdout() -> None:
+    """標準出力・標準エラーをUTF-8にする。
+
+    Windows のコンソール既定は cp932 で、日本語やUnicode記号を含むログが
+    UnicodeEncodeError で落ちることがある。全CLIの冒頭で呼ぶ。
+    """
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (OSError, ValueError):
+            continue
 
 
 def run_command(args: list[str], label: str) -> str:

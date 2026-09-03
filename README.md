@@ -104,7 +104,7 @@ python .agents/skills/agentic-video-analysis-skill/scripts/analyze_tile_manifest
 | タイル化（単一範囲 / config複数範囲 / zoom） | `scripts/tile_video_frames.py` |
 | 解析（単一 / 複数manifest / summary一括 / 並列 / 分割） | `scripts/analyze_tile_manifest.py` |
 
-各フレームには `F<index> t=<秒>s` のラベル（600秒超は `m:ss.s`）が付き、解析結果はセルラベルを根拠に記述します。manifest 内の全タイルは **原則1回の API 呼び出し**でまとめて渡されます（`--max-tiles-per-call` 超過時のみ時系列で分割）。共通処理は `scripts/common.py` に集約しています。
+各フレームには `F<index> t=<秒>s` のラベル（600秒超は `m:ss.s`）が付き、解析結果はセルラベルを根拠に記述します。manifest 内の全タイルは **原則1回の API 呼び出し**でまとめて渡されます（`--max-tiles-per-call` 超過時のみ時系列で分割）。処理本体は `scripts/avs/` パッケージ（`common` / `tiling` / `ranges` / `prompts` / `analysis`）にあり、CLI は引数解釈だけを行います。
 
 ## 実行の流れ
 
@@ -143,7 +143,7 @@ Step 4 最終出力    確定した見どころ候補だけを final.md にま�
 ```text
 skills/agentic-video-analysis-skill/
   SKILL.md              # エージェント向け手順書
-  scripts/              # common.py + タイル化・解析CLI
+  scripts/              # タイル化・解析CLI + avs/ パッケージ（実装本体）
   prompts/              # overview / detail / zoom / refine プロンプト
   examples/             # 候補範囲定義の雛形
 ```
