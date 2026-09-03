@@ -1,0 +1,9 @@
+# 実行成果物
+output/
+# Python
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+# 評価用の実データ（動画・正解データはローカルで用意する）
+eval/fixtures/
