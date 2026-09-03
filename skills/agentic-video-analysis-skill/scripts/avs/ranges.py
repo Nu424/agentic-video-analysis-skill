@@ -136,6 +136,8 @@ def resolve_output_path(config: dict[str, Any], merged: dict[str, Any]) -> Path:
 _RANGE_OPTION_KEYS = (
     "fps",
     "pad",
+    "crop",  # zoom range（timestamps 付き）のみ有効。ffmpeg の crop 記法 "W:H:X:Y"
+    "scale",  # zoom range のみ有効。整数倍拡大
     "frames_per_tile",
     "width",
     "tile_width",

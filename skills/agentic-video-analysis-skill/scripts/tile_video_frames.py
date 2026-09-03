@@ -7,6 +7,11 @@
     --video video.mp4 --start 36 --end 46 --fps 5 --pad 2 \
     --output output/agentic_tiles/video_36_46_fps5.jpg
 
+ズーム（特定時刻をフル解像度で / ROI クロップと整数倍拡大）:
+  python .agents/skills/agentic-video-analysis-skill/scripts/tile_video_frames.py \
+    --video video.mp4 --timestamps 34.0,34.4 --crop 280:200:0:0 --scale 2 \
+    --output output/agentic_zooms/hud_34.jpg
+
 複数範囲（config）:
   python .agents/skills/agentic-video-analysis-skill/scripts/tile_video_frames.py \
     --config .agents/skills/agentic-video-analysis-skill/examples/ranges.example.json \
@@ -55,6 +60,20 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--timestamps",
         default=None,
         help="ズームモード: 抽出する時刻をカンマ区切りで指定（例 38.5,40.2）。--start/--end/--fps と排他",
+    )
+    parser.add_argument(
+        "--crop",
+        default=None,
+        help=(
+            "ズームモード: 切り出す領域を ffmpeg の crop 記法 W:H:X:Y で指定（例 280:200:0:0）。"
+            "状態表示など画面の一部を読みたいときに使う"
+        ),
+    )
+    parser.add_argument(
+        "--scale",
+        type=int,
+        default=1,
+        help="ズームモード: 切り出した画像を整数倍に拡大する（既定: 1 = 等倍）",
     )
     parser.add_argument("-o", "--output", default=None, help="出力画像パス、または複数タイル時のベースパス")
     parser.add_argument(

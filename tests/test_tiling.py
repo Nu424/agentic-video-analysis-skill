@@ -11,6 +11,7 @@ from pathlib import Path
 
 import pytest
 
+import avs.tiling as tiling_module
 from avs.common import format_timestamp
 from avs.tiling import (
     DEFAULT_EXTRACT_WIDTH,
@@ -18,12 +19,16 @@ from avs.tiling import (
     TileOptions,
     apply_pad,
     auto_cols,
+    build_frame_filters,
     chunk_frames,
     compute_grid,
+    extract_single_frame,
+    parse_crop,
     parse_timestamps,
     resolve_output_layout,
     tile_one_range,
     tile_zoom,
+    validate_options,
 )
 
 
@@ -202,3 +207,91 @@ def test_tile_zoom_rejects_timestamp_beyond_duration(synth_video, tmp_path):
     options = TileOptions(video=str(synth_video), output=str(tmp_path / "zoom.jpg"))
     with pytest.raises(RuntimeError):
         tile_zoom(options, [999.0])
+
+
+# --- crop / scale（zoom モード） ---------------------------------------------
+
+
+def test_parse_crop():
+    assert parse_crop("280:200:0:0") == (280, 200, 0, 0)
+    assert parse_crop(" 16 : 9 : 4 : 2 ") == (16, 9, 4, 2)
+    for bad in ("280:200:0", "a:b:c:d", "0:200:0:0", "280:200:-1:0"):
+        with pytest.raises(RuntimeError):
+            parse_crop(bad)
+
+
+def test_build_frame_filters_order():
+    # 適用順は crop -> scale(整数倍) -> width
+    assert build_frame_filters("280:200:0:0", 2, None) == "crop=280:200:0:0,scale=iw*2:ih*2"
+    assert build_frame_filters("280:200:0:0", 1, None) == "crop=280:200:0:0"
+    assert build_frame_filters(None, 3, None) == "scale=iw*3:ih*3"
+    assert build_frame_filters(None, 1, 640) == "scale=640:-2"
+    assert (
+        build_frame_filters("280:200:0:0", 2, 640)
+        == "crop=280:200:0:0,scale=iw*2:ih*2,scale=640:-2"
+    )
+    # 何も指定が無ければ -vf を付けない
+    assert build_frame_filters(None, 1, None) is None
+    with pytest.raises(RuntimeError):
+        build_frame_filters(None, 0, None)
+
+
+def test_extract_single_frame_builds_ffmpeg_args(tmp_path, monkeypatch):
+    captured: list[list[str]] = []
+
+    def fake_run_command(args, label):
+        captured.append(args)
+        Path(args[-1]).write_bytes(b"jpeg")
+        return ""
+
+    monkeypatch.setattr(tiling_module, "run_command", fake_run_command)
+    out_path = tmp_path / "zoom.jpg"
+    extract_single_frame(
+        Path("video.mp4"), out_path, 34.0, None, 5, crop="280:200:0:0", scale=2
+    )
+
+    args = captured[0]
+    assert args[0] == "ffmpeg"
+    assert args[args.index("-ss") + 1] == "34.000000"
+    assert args[args.index("-vf") + 1] == "crop=280:200:0:0,scale=iw*2:ih*2"
+    assert args[-1] == str(out_path)
+
+
+def test_extract_single_frame_without_filters(tmp_path, monkeypatch):
+    captured: list[list[str]] = []
+
+    def fake_run_command(args, label):
+        captured.append(args)
+        Path(args[-1]).write_bytes(b"jpeg")
+        return ""
+
+    monkeypatch.setattr(tiling_module, "run_command", fake_run_command)
+    extract_single_frame(Path("video.mp4"), tmp_path / "zoom.jpg", 1.0, None, 5)
+    assert "-vf" not in captured[0]
+
+
+def test_tile_mode_rejects_crop_and_scale():
+    # crop / scale は zoom モード専用
+    with pytest.raises(RuntimeError, match="zoom"):
+        validate_options(TileOptions(video="video.mp4", crop="10:10:0:0"))
+    with pytest.raises(RuntimeError, match="zoom"):
+        validate_options(TileOptions(video="video.mp4", scale=2))
+
+
+def test_tile_zoom_with_crop_and_scale(synth_video, tmp_path):
+    options = TileOptions(
+        video=str(synth_video),
+        output=str(tmp_path / "hud.jpg"),
+        crop="160:90:10:20",
+        scale=2,
+    )
+    result = tile_zoom(options, [3.5])
+
+    manifest = _read_manifest(Path(result["manifest_path"]))
+    assert manifest["extraction"]["crop"] == "160:90:10:20"
+    assert manifest["extraction"]["scale"] == 2
+
+    tile = manifest["tiles"][0]
+    # 160x90 を切り出して2倍 -> 320x180
+    assert (tile["cell_width"], tile["cell_height"]) == (320, 180)
+    assert Path(tile["path"]).exists()

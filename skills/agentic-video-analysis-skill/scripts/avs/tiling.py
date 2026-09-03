@@ -5,6 +5,7 @@
 
 - `tile_one_range(options)`: 範囲を fps で等間隔サンプリングし、格子状タイルにする
 - `tile_zoom(options, timestamps)`: 指定時刻をフル解像度で1枚ずつ切り出す
+  （`crop` / `scale` で ROI の切り出しと整数倍拡大ができる）
 
 どちらも `TileOptions`（argparse.Namespace 互換の属性を持つデータクラス）を受け取り、
 manifest v2（`tiles` 配列 + `extraction` + `tiling`）を書き出す。
@@ -59,6 +60,8 @@ class TileOptions:
     pad: float = 0.0
     fps: float | None = 1.0
     timestamps: str | None = None
+    crop: str | None = None  # zoom モードのみ。ffmpeg の crop 記法 "W:H:X:Y"
+    scale: int = 1  # zoom モードのみ。整数倍拡大
     output: str | None = None
     metadata_output: str | None = None
     frames_per_tile: int = DEFAULT_FRAMES_PER_TILE
@@ -125,6 +128,11 @@ def resolve_output_layout(output_path: Path, tile_count: int) -> dict[str, Any]:
 
 
 def validate_options(options: TileOptions) -> dict[str, Any]:
+    # crop / scale は zoom モード（--timestamps）専用
+    if options.crop is not None or (1 if options.scale is None else int(options.scale)) != 1:
+        raise RuntimeError(
+            "--crop / --scale は zoom モード（--timestamps、config の range では timestamps）でのみ使えます"
+        )
     # タイル化モードでの既定値解決（None は zoom モード判別のための未指定マーカ）
     if options.width is None:
         options.width = DEFAULT_EXTRACT_WIDTH
@@ -410,6 +418,8 @@ def build_manifest(
             "pad_sec": options.pad,
             "fps": options.fps,
             "extract_width": options.width,
+            "crop": options.crop,
+            "scale": options.scale,
             "frame_count_total": sum(tile["frame_count"] for tile in tile_entries),
             "kept_frames_dir": str(temp_frames_dir) if temp_frames_dir else None,
         },
@@ -552,12 +562,54 @@ def parse_timestamps(spec: str) -> list[float]:
     return values
 
 
+def parse_crop(spec: str) -> tuple[int, int, int, int]:
+    """ffmpeg の crop 記法 `W:H:X:Y` を検証して (W, H, X, Y) にする。"""
+    parts = [token.strip() for token in str(spec).split(":")]
+    if len(parts) != 4:
+        raise RuntimeError(f"--crop は W:H:X:Y の形式で指定してください: {spec!r}")
+    try:
+        width, height, left, top = (int(part) for part in parts)
+    except ValueError as exc:
+        raise RuntimeError(f"--crop の値は整数で指定してください: {spec!r}") from exc
+    if width < 1 or height < 1:
+        raise RuntimeError(f"--crop の W / H は 1 以上を指定してください: {spec!r}")
+    if left < 0 or top < 0:
+        raise RuntimeError(f"--crop の X / Y は 0 以上を指定してください: {spec!r}")
+    return width, height, left, top
+
+
+def build_frame_filters(
+    crop: str | None,
+    scale: int,
+    extract_width: int | None,
+) -> str | None:
+    """zoom モードの `-vf` を組み立てる。適用順は crop -> scale(整数倍) -> width。
+
+    `--width` が指定されていれば、従来どおり最後にその幅へリサイズする。
+    どれも指定が無ければ None（`-vf` を付けない）。
+    """
+    filters: list[str] = []
+    if crop:
+        width, height, left, top = parse_crop(crop)
+        filters.append(f"crop={width}:{height}:{left}:{top}")
+    factor = 1 if scale is None else int(scale)
+    if factor < 1:
+        raise RuntimeError("--scale は 1 以上の整数を指定してください")
+    if factor > 1:
+        filters.append(f"scale=iw*{factor}:ih*{factor}")
+    if extract_width:
+        filters.append(f"scale={extract_width}:-2")
+    return ",".join(filters) if filters else None
+
+
 def extract_single_frame(
     video_path: Path,
     out_path: Path,
     timestamp_sec: float,
     extract_width: int | None,
     ffmpeg_quality: int,
+    crop: str | None = None,
+    scale: int = 1,
 ) -> None:
     out_path.parent.mkdir(parents=True, exist_ok=True)
     args = [
@@ -573,8 +625,9 @@ def extract_single_frame(
         "-frames:v",
         "1",
     ]
-    if extract_width:
-        args.extend(["-vf", f"scale={extract_width}:-2"])
+    filters = build_frame_filters(crop, scale, extract_width)
+    if filters:
+        args.extend(["-vf", filters])
     args.extend(["-q:v", str(ffmpeg_quality), str(out_path)])
     run_command(args, "ffmpeg (zoom)")
     if not out_path.exists():
@@ -628,6 +681,9 @@ def tile_zoom(options: TileOptions, timestamps: list[float]) -> dict[str, Any]:
     # zoom の既定: リサイズなし・品質90（明示指定があれば尊重）
     extract_width = options.width  # None ならフル解像度
     quality = options.quality if options.quality is not None else DEFAULT_ZOOM_QUALITY
+    scale = 1 if options.scale is None else int(options.scale)
+    # 形式エラーはフレーム抽出の前に出す
+    build_frame_filters(options.crop, scale, extract_width)
 
     duration_sec = probe_duration_sec(video_path)
     source_width, source_height = probe_video_size(video_path)
@@ -656,7 +712,15 @@ def tile_zoom(options: TileOptions, timestamps: list[float]) -> dict[str, Any]:
     try:
         for index, ts in enumerate(timestamps):
             raw_frame = temp_root / f"zoom_{index:03d}.jpg"
-            extract_single_frame(video_path, raw_frame, ts, extract_width, options.ffmpeg_quality)
+            extract_single_frame(
+                video_path,
+                raw_frame,
+                ts,
+                extract_width,
+                options.ffmpeg_quality,
+                crop=options.crop,
+                scale=scale,
+            )
             image, meta = render_zoom_image(raw_frame, index, ts, options.label_height, long_form_labels)
             tile_path = layout["tile_paths"][index]
             tile_path.parent.mkdir(parents=True, exist_ok=True)
@@ -693,7 +757,7 @@ def tile_zoom(options: TileOptions, timestamps: list[float]) -> dict[str, Any]:
             "end_sec": max(timestamps),
         }
         # build_manifest 用に options の派生値を整える
-        zoom_options = options.copy(width=extract_width, fps=None)
+        zoom_options = options.copy(width=extract_width, fps=None, scale=scale)
         manifest = build_manifest(
             context, zoom_options, tile_entries, None, approach="agentic_video_frame_zoom"
         )
