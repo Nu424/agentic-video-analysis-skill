@@ -1,9 +1,9 @@
 {
   "video": "video.mp4",
-  "output_dir": "output/agentic_sessions/example/candidates",
+  "output_dir": "output/agentic_sessions/example/ranges",
   "defaults": {
     "fps": 5,
-    "pad": 2,
+    "pad": 1,
     "frames_per_tile": 12
   },
   "ranges": [
@@ -19,7 +19,14 @@
       "start": 49,
       "end": 53.5,
       "priority": "high"
+    },
+    {
+      "label": "zoom_status_34",
+      "timestamps": [34.0, 34.4],
+      "crop": "280:200:0:0",
+      "scale": 2,
+      "note": "状態表示の数値を読みたい。timestamps を持つ range は zoom として処理され、crop（ffmpegの W:H:X:Y）で切り出して scale 倍に拡大する。座標は例示なので、実際の値は domain.json の hud_notes やフルフレームのズーム結果から決める"
     }
   ],
-  "summary_output": "output/agentic_sessions/example/candidates/batch_summary.json"
+  "summary_output": "output/agentic_sessions/example/ranges/batch_summary.json"
 }

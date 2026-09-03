@@ -47,8 +47,11 @@ SKILL.md（P7 で改訂）はこの文書を圧縮したものになる。コマ
 python S/run_pipeline.py --video video.mp4 --objective "動画の見どころ候補の抽出" --domain notes/domain.json
 ```
 
-これで以下が順に走り、`output/agentic_sessions/<stem>_<timestamp>/` に成果物が揃う。
-各ステップは出力が既にあればスキップされるので、途中で止まっても同じコマンドで再開できる。
+これで以下が順に走り、`output/agentic_sessions/<stem>_<timestamp>/` に成果物が揃う（親ディレクトリは `--session-root` で変えられる）。
+各ステップは主要な出力が既にあればスキップされるので、途中で止まっても同じコマンドで再開できる（全部やり直すなら `--force`）。
+
+先に `--dry-run` を付けると、範囲数・fps・呼び出し予定だけを表示して API を呼ばない（タイル化は実行する）。
+dry-run で作られるのは仮の計画なので、**同じセッションのまま `--dry-run` を外して本番実行してよい**（計画は作り直される）。
 
 ### 1.1 内部で起きること
 
@@ -56,17 +59,38 @@ python S/run_pipeline.py --video video.mp4 --objective "動画の見どころ候
 |------|------|---------|-------|
 | 0 | セッション作成、`ffprobe` で長さ取得 | `session.json` | |
 | 1 | **全体把握**: 全編を低 fps でタイル化し `overview.txt` で解析。候補は全区間をカバーするよう 4〜8 秒単位で出る | `overview/full/`, `overview/overview_analysis.json` | overview fps 1（native は動画全体を fps 1 で送る） |
-| 1' | 動画が 10 分超なら先に章立て（`chapters.txt`, fps 0.1〜0.2）→ 章ごとに overview | `overview/chapters_analysis.json`, `overview/<章>/…` | |
-| 2 | **範囲計画**: 候補をマージ・分割し、隙間を low で埋め、末尾を必ず含む `ranges.json` を作る | `ranges/ranges.json` | 範囲長 ≤ 8 秒、pad 1.0、coverage は 10 分以下なら `full` |
-| 3 | tile 経路のみ: 全範囲を一括タイル化 | `ranges/<label>/tile_*.jpg`, `manifest.json`, `ranges/batch_summary.json` | detail fps 5、12 枚/タイル |
-| 4 | **詳細解析**: 範囲ごとに `detail.txt` で出来事を悉皆列挙。overview の `reason` が仮説として注入され、`hypothesis_verdict` で確認・反証される | `ranges/<label>_analysis.json` (+ `.raw.txt`, `.meta.json`, `prompt.txt`) | 並列 4、範囲ごとに失敗隔離 |
-| 5 | **バリデーション**: ネガティブ一致・根拠引用なし・範囲外引用・境界・長さ異常・低確信にフラグ | `ranges/<label>_validated.json`, `merge/validation_report.json` | 削除はしない |
-| 6 | **統合**: 機械的に重複を統合 → `merge.txt` で LLM 統合（追加禁止）→ `final.md` 生成 | `merge/timeline_mechanical.json`, `merge/timeline.json`, `final.md` | |
+| 1' | 動画が `--full-coverage-max-sec`（既定 600 秒）超なら先に章立て（`chapters.txt`, `--chapters-fps` 既定 0.15）→ 章ごとに overview | `overview/chapters_analysis.json`, `overview/<章>_analysis.json` | |
+| 2 | **範囲計画**: 候補をマージ・分割し、隙間を low で埋め、末尾を必ず含む `ranges.json` を作る | `ranges/ranges.json` | 範囲長 ≤ 8 秒、pad 1.0、coverage は 600 秒以下なら `full` |
+| 3 | tile 経路のみ: 全範囲を一括タイル化 | `ranges/<label>_fps<fps>/tile_*.jpg`, `manifest.json`, `ranges/batch_summary.json` | detail fps 5、12 枚/タイル |
+| 4 | **詳細解析**: 範囲ごとに `detail.txt` で出来事を悉皆列挙。overview の `reason` が仮説として注入され、`hypothesis_verdict` で確認・反証される | `ranges/<label>_fps<fps>_analysis.json` (+ `.raw.txt`, `.meta.json`, `.prompt.txt`) | 並列 4、範囲ごとに失敗隔離 |
+| 5 | **バリデーション**: ネガティブ一致・根拠引用なし・範囲外引用・境界・長さ異常・低確信にフラグ | `ranges/<label>_fps<fps>_validated.json`, `merge/validation_report.json` | 削除はしない |
+| 6 | **統合**: 機械的に重複を統合 → `merge.txt` で LLM 統合（追加禁止）→ `final.md` 生成 | `merge/timeline_mechanical.json`, `merge/timeline.json`, `final.md` | `--no-llm-merge` で機械統合のみ |
 | 7 | **レポート**: 呼び出し回数・トークン・USD・所要時間と**次アクション候補**を表示 | `usage.jsonl` 集計 | |
+
+### 1.1' ドライバの主なオプション
+
+| オプション | 既定 | 用途 |
+|-----------|------|------|
+| `--objective` / `--domain` | 見どころ候補の抽出 / なし | 目的とドメイン定義（§0.3）。`--domain` は `notes/domain.json` にコピーされ全ステップで使われる |
+| `--backend` / `--input` / `--model` | openrouter / tile / backend 既定 | バックエンドと入力形式（§0.2） |
+| `--session` / `--session-root` | 新規作成 / `output/agentic_sessions` | 既存セッションの再開 / セッションを作る親ディレクトリ |
+| `--overview-fps` / `--detail-fps` / `--low-fps` / `--chapters-fps` | 1 / 5 / 1 / 0.15 | 各段階の fps |
+| `--coverage` | `auto` | `full` / `priority` / `high-only`（§4） |
+| `--full-coverage-max-sec` | 600 | この秒数を超えたら長尺分岐（章立て + coverage priority）に入る |
+| `--max-range-sec` / `--pad` / `--frames-per-tile` / `--jobs` | 8 / 1 / 12 / 4 | 範囲計画とタイル化・並列度 |
+| `--no-llm-merge` | off | Step 6 で LLM 統合を省き、機械統合の結果をそのまま `timeline.json` にする |
+| `--strict-json` / `--force` / `--dry-run` | off | 構造化出力の強制 / 全ステップ再実行 / 実行予定の表示のみ |
 
 ### 1.2 終了時にエージェントが確認すること
 
-`session_report.py` の出力（ドライバ終了時にも同じものが出る）を読み、次を判断する。
+`session_report.py` の出力（ドライバ終了時にも同じものが出る）と、ドライバが最後に出す「次にやること」を読み、次を判断する。
+
+```text
+## 次にやること
+1. バリデーションのフラグが 10 件あります。<session>/merge/validation_report.json を開き、negative_match は根拠セルを画像で目視、boundary は範囲を広げて再解析してください
+2. zoom_targets が 4 件あります（0.2s, 6.7s, 14.2s, 21.7s）。tile_video_frames.py --timestamps <秒> でズームし、prompts/zoom.txt で確認してください
+3. confidence=low の出来事が 4 件あります。細部が原因ならズーム（prompts/zoom.txt）、範囲の境界が原因なら精密確認（prompts/refine.txt）を行ってください
+```
 
 1. **失敗した範囲**があるか → `analyze.py --summary ranges/batch_summary.json --prompt prompts/detail.txt` を再実行（既存出力はスキップされるので失敗分だけ走る）。
 2. **`negative_match`** のフラグ → その範囲のタイル画像（tile 経路）を開いて根拠セルを目視、またはズーム確認（§2.1）。確認できなければ final.md の「注意点」に「未確認」と書く。採用/不採用の判断はしない。
@@ -154,6 +178,7 @@ python S/merge_analyses.py --session <session> --audio <session>/audio/audio_ana
 ```
 
 - 必ず全編を送る（範囲を絞ると映像を見ずに音声から内容を捏造した実測がある）。
+- `--objective` と `--domain` を渡せば、目的とドメインの手引きが音声プロンプトにも入る。出力は `<session>/audio/audio_analysis.json`（既にあればスキップ。`--force` で再解析）。
 - 音声由来の項目は `source: "audio"` で timeline に入り、映像側の出来事と重ならないものは `audio_unconfirmed` フラグが付く。**音声の主張は映像根拠と突き合わせてから採用する。**
 
 ### 2.8 モデル・バックエンドを変えて再実行する
@@ -170,7 +195,7 @@ python S/merge_analyses.py --session <session> --audio <session>/audio/audio_ana
 ```bash
 # Step 1 全体把握
 python S/tile_video_frames.py --video video.mp4 --fps 1 --output <session>/overview/full.jpg
-python S/analyze.py --manifest <session>/overview/full/manifest.json --prompt prompts/overview.txt --objective "…" --domain notes/domain.json --session <session>
+python S/analyze.py --manifest <session>/overview/full/manifest.json --prompt prompts/overview.txt --objective "…" --domain notes/domain.json --output <session>/overview/overview_analysis.json --session <session>
 
 # Step 2 範囲計画（全区間カバー）
 python S/plan_ranges.py --overview <session>/overview/overview_analysis.json --video video.mp4 --output <session>/ranges/ranges.json --coverage full --detail-fps 5
@@ -180,10 +205,11 @@ python S/tile_video_frames.py --config <session>/ranges/ranges.json --merge-over
 
 # Step 4 詳細解析
 python S/analyze.py --summary <session>/ranges/batch_summary.json --prompt prompts/detail.txt --objective "…" --domain notes/domain.json --session <session> --jobs 4
-#   native 経路: python S/analyze.py --ranges <session>/ranges/ranges.json --backend gemini --prompt prompts/detail.txt ...
+#   native 経路（--backend gemini 限定。--output-dir は必須）:
+#   python S/analyze.py --ranges <session>/ranges/ranges.json --backend gemini --prompt prompts/detail.txt --output-dir <session>/ranges --session <session>
 
 # Step 5 バリデーション
-python S/validate_analysis.py --summary <session>/ranges/batch_summary.json --domain notes/domain.json
+python S/validate_analysis.py --summary <session>/ranges/batch_summary.json --domain notes/domain.json --report
 
 # Step 6 統合と final.md
 python S/merge_analyses.py --session <session> --objective "…" --domain notes/domain.json --final-md
@@ -196,14 +222,14 @@ python S/session_report.py --session <session>
 
 ---
 
-## 4. 長尺動画（10 分超）
+## 4. 長尺動画（既定 600 秒超）
 
-1. **章立て**: `tile_video_frames.py --video long.mp4 --fps 0.15` → `analyze.py --prompt prompts/chapters.txt`。大きな区切り（場面転換・画面構成の変化）を列挙する。
-2. **章ごとの overview**: 章を範囲とする config を作り `--config` で一括タイル化（fps 1）→ `analyze.py --summary … --prompt prompts/overview.txt`。
-3. **範囲計画**: `plan_ranges.py --coverage priority`（既定）。high/medium は fps 5、low は fps 1。コストが厳しければ `high-only`。
-4. 以降は標準と同じ。`session_report.py --estimate` で解析前に範囲数 × fps からトークンとコストの概算が出るので、超過するなら coverage を落とす。
+1. **章立て**: `tile_video_frames.py --video long.mp4 --fps 0.15` → `analyze.py --prompt prompts/chapters.txt`。大きな区切り（場面転換・画面構成の変化）を列挙する。fps は `--chapters-fps`（既定 0.15）。
+2. **章ごとの overview**: 章を範囲とする config を作り `--config` で一括タイル化（fps 1）→ `analyze.py --summary … --prompt prompts/overview.txt`。章ごとの結果はドライバが 1 つの `overview_analysis.json` に統合する。
+3. **範囲計画**: `plan_ranges.py --coverage priority`（長尺の既定）。high/medium は `--detail-fps`（5）、low は `--low-fps`（1）。コストが厳しければ `high-only`。
+4. 以降は標準と同じ。`session_report.py --session <session> --estimate` で解析前に範囲数 × fps からトークンとコストの概算が出るので、超過するなら coverage を落とす。
 
-ドライバは動画長 600 秒超で自動的にこの分岐に入る。全編を一律に高 fps で解析しない。
+ドライバは動画長が `--full-coverage-max-sec`（既定 600）秒を超えると自動的にこの分岐に入る。全編を一律に高 fps で解析しない。
 
 ---
 
@@ -227,14 +253,17 @@ output/agentic_sessions/<stem>_<timestamp>/
   usage.jsonl                      LLM 呼び出しごとの usage / cost / latency（1 行 1 呼び出し）
   overview/
     full/tile_*.jpg, manifest.json overview のタイル（tile 経路）
-    overview_analysis.json         候補範囲（+ .raw.txt / .meta.json / prompt.txt）
-    chapters_analysis.json         長尺のみ
+    overview_analysis.json         候補範囲（+ .raw.txt / .meta.json / .prompt.txt）
+    chapters_analysis.json         長尺のみ。章立ての結果
+    chapters_ranges.json           長尺のみ。章を範囲とする config
+    chapters_summary.json          長尺のみ。章ごとのタイル化結果
+    <章ラベル>_analysis.json        長尺のみ。章ごとの overview
   ranges/
     ranges.json                    全区間カバーの範囲計画（config 形式）
     batch_summary.json             タイル化結果と各範囲の note / error
-    <label>/tile_*.jpg, manifest.json
-    <label>_analysis.json          detail の出来事リスト
-    <label>_validated.json         flags 付き
+    <label>_fps<fps>/tile_*.jpg, manifest.json   例: cand_00_0_fps5.0/
+    <label>_fps<fps>_analysis.json detail の出来事リスト
+    <label>_fps<fps>_validated.json flags 付き
   zooms/                           ズーム・クロップの画像と解析（任意）
   refinements/                     精密確認の画像と解析（任意）
   audio/audio_analysis.json        音声（gemini のみ、任意）
@@ -247,8 +276,10 @@ output/agentic_sessions/<stem>_<timestamp>/
   notes/                           domain.json のコピー、候補メモなど
 ```
 
-**final.md の構成**は v1 と同じ（概要 / 見どころ候補 / 追加確認した範囲 / タイムライン要約 / 注意点）。
-各候補の「根拠」には、解析ファイル名とセルラベル（`ranges/cand_a_analysis.json`, `F12 t=39.4s`）を必ず書く。tile 経路ならそのセルを人間が画像で確認できる。
+**final.md の構成**は v1 と同じ（概要 / 見どころ候補 / 追加確認した範囲 / タイムライン要約 / 注意点）で、
+`merge_analyses.py --final-md` が `timeline.json` から機械生成する。「見どころ候補」は `importance` が low 以外の項目、
+「タイムライン要約」は全項目、「注意点」はフラグの付いた項目と反証された仮説。
+各候補の「根拠」には、解析ファイル名とセルラベル（`ranges/cand_00_0_fps5.0_analysis.json`, `F12 t=39.4s`）を必ず書く。tile 経路ならそのセルを人間が画像で確認できる。
 
 ---
 
