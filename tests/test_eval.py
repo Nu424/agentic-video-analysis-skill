@@ -397,6 +397,44 @@ def test_summarize_cost_empty_records() -> None:
     assert summary["unknown_cost_calls"] == 0
 
 
+def test_summarize_cost_prefers_step_field_over_name_keywords() -> None:
+    # name はキーワード判定だと "other" に落ちる detail の呼び出し名だが、
+    # step フィールドが明示されていればそちらを優先する。
+    records = [
+        {
+            "name": "cand_00_fps5.0_analysis",
+            "step": "detail",
+            "usage": {"input_tokens": 100, "output_tokens": 20, "reasoning_tokens": 0, "total_tokens": 120},
+            "cost_usd": 0.001,
+            "cost_is_estimate": False,
+        },
+    ]
+    summary = score.summarize_cost(records)
+    assert set(summary["by_step"]) == {"detail"}
+    assert summary["by_step"]["detail"]["calls"] == 1
+
+
+def test_summarize_cost_falls_back_to_keywords_without_step_field() -> None:
+    # step フィールドが無い（旧形式の）行は従来通りキーワードで判定する。
+    records = [
+        {
+            "name": "overview_full_analysis",
+            "usage": {"input_tokens": 100, "output_tokens": 20, "reasoning_tokens": 0, "total_tokens": 120},
+            "cost_usd": 0.001,
+            "cost_is_estimate": False,
+        },
+        {
+            "name": "cand_00_fps5.0_analysis",
+            "usage": {"input_tokens": 100, "output_tokens": 20, "reasoning_tokens": 0, "total_tokens": 120},
+            "cost_usd": 0.001,
+            "cost_is_estimate": False,
+        },
+    ]
+    summary = score.summarize_cost(records)
+    assert set(summary["by_step"]) == {"overview", "other"}
+    assert summary["by_step"]["other"]["calls"] == 1
+
+
 # --- CLI (main) --------------------------------------------------------------------
 
 

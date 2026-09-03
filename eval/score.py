@@ -289,6 +289,19 @@ def _classify_step(name: str) -> str:
     return "other"
 
 
+def _step_of(record: dict[str, Any]) -> str:
+    """usage.jsonl の 1 行のステップ名。`step` があればそれを使う（avs/session.py: step_of と同じ規則）。
+
+    `step` は呼び出し元がプロンプト名から決めた正確な値（`cand_00_analysis` のような
+    出力名からのキーワード推測では detail が other に落ちるため）。`eval/` は `avs` に
+    依存しない方針のため import はせず、同じ規則をここに書く。
+    """
+    step = record.get("step")
+    if isinstance(step, str) and step:
+        return step
+    return _classify_step(str(record.get("name") or ""))
+
+
 def load_usage_records(session_dir: str | Path) -> list[dict[str, Any]]:
     """`<session>/usage.jsonl` を読む（`avs/analysis.py` が書く 1 行 1 呼び出しの監査ログ）。"""
     usage_path = Path(session_dir) / "usage.jsonl"
@@ -330,7 +343,7 @@ def summarize_cost(records: list[dict[str, Any]]) -> dict[str, Any]:
         else:
             actual_cost += float(cost)
 
-        step = _classify_step(str(record.get("name") or ""))
+        step = _step_of(record)
         bucket = by_step.setdefault(step, {"calls": 0, "total_tokens": 0, "cost_usd": 0.0})
         bucket["calls"] += 1
         bucket["total_tokens"] += int(usage.get("total_tokens") or 0)
