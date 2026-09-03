@@ -122,6 +122,14 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         help="追加コンテキスト（テキスト or ファイルパス）。プロンプト末尾に付加する",
     )
     parser.add_argument(
+        "--domain",
+        default=None,
+        help=(
+            "ドメイン定義JSON（examples/domain.example.json の形式）。"
+            "手引きと誤認されやすい事象をプロンプトに付ける"
+        ),
+    )
+    parser.add_argument(
         "--backend",
         choices=list(BACKEND_NAMES),
         default=DEFAULT_BACKEND,
@@ -138,7 +146,10 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--api-key",
         default=None,
-        help="APIキー。省略時は 環境変数 -> ./.env -> ~/.env.global の順に探す",
+        help=(
+            "APIキー。省略時は 環境変数 -> ./.env -> ~/.env.global の順に探す"
+            "（非推奨。プロセス一覧に露出しうるため環境変数か .env を推奨）"
+        ),
     )
     parser.add_argument(
         "--raw",

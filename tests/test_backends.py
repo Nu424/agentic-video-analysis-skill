@@ -20,7 +20,7 @@ import pytest
 
 from avs.backends import get_backend
 from avs.backends.base import LLMRequest, MediaImage, MediaVideoClip, describe_media
-from avs.backends.gemini import GeminiBackend, build_processing, format_offset
+from avs.backends.gemini import GeminiBackend, build_processing, format_offset, hash_file_content
 from avs.backends.openrouter import OpenRouterBackend
 from avs.cost import estimate_cost_usd
 
@@ -179,6 +179,34 @@ def test_openrouter_normalizes_usage_and_cost(monkeypatch):
 
     # 実コストがあるので概算ではない
     assert estimate_cost_usd(response.model, response.usage) == (0.0123, False)
+
+
+def test_openrouter_cost_normalizes_numeric_string(monkeypatch):
+    usage = {"prompt_tokens": 10, "completion_tokens": 5, "total_tokens": 15, "cost": "0.05"}
+    recorded: list = []
+    install_urlopen(monkeypatch, [openrouter_response(usage=usage)], recorded)
+
+    response = OpenRouterBackend(api_key="k").complete(LLMRequest(prompt="p", media=[]))
+    assert response.usage["cost_usd"] == pytest.approx(0.05)
+    assert isinstance(response.usage["cost_usd"], float)
+
+
+def test_openrouter_cost_none_for_unparseable_value(monkeypatch):
+    usage = {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2, "cost": "not-a-number"}
+    recorded: list = []
+    install_urlopen(monkeypatch, [openrouter_response(usage=usage)], recorded)
+
+    response = OpenRouterBackend(api_key="k").complete(LLMRequest(prompt="p", media=[]))
+    assert response.usage["cost_usd"] is None
+
+
+def test_openrouter_cost_none_for_non_finite_value(monkeypatch):
+    usage = {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2, "cost": float("nan")}
+    recorded: list = []
+    install_urlopen(monkeypatch, [openrouter_response(usage=usage)], recorded)
+
+    response = OpenRouterBackend(api_key="k").complete(LLMRequest(prompt="p", media=[]))
+    assert response.usage["cost_usd"] is None
 
 
 def test_openrouter_cost_falls_back_to_price_table(monkeypatch):
@@ -426,6 +454,126 @@ def test_gemini_upload_cache_is_reused(tmp_path, fake_client, gemini_recorder):
     assert len(gemini_recorder["uploads"]) == 1  # 2 回目はアップロードしない
     assert gemini_recorder["gets"] == ["files/abc"]  # ACTIVE 確認だけ行う
     assert len(list(cache_dir.glob("*.json"))) == 1
+
+
+def test_gemini_upload_cache_is_keyed_by_content_not_path(tmp_path, fake_client, gemini_recorder):
+    """パスが違っても内容が同じなら同じキャッシュエントリを再利用する。"""
+    cache_dir = tmp_path / "uploads"
+    video_a = tmp_path / "a.mp4"
+    video_b = tmp_path / "b.mp4"
+    video_a.write_bytes(b"same-bytes")
+    video_b.write_bytes(b"same-bytes")
+    backend = GeminiBackend(client=fake_client, cache_dir=cache_dir)
+
+    backend.upload(video_a)
+    backend.upload(video_b)
+
+    assert len(gemini_recorder["uploads"]) == 1
+    assert len(list(cache_dir.glob("*.json"))) == 1
+    assert hash_file_content(video_a) == hash_file_content(video_b)
+
+
+def test_gemini_upload_reuploads_when_content_changes_at_same_path(tmp_path, fake_client, gemini_recorder):
+    """同一パスでも内容が変われば別のキャッシュキーになり再アップロードする。"""
+    cache_dir = tmp_path / "uploads"
+    video = tmp_path / "v.mp4"
+    video.write_bytes(b"content-v1")
+    backend = GeminiBackend(client=fake_client, cache_dir=cache_dir)
+    backend.upload(video)
+
+    video.write_bytes(b"content-v2-is-quite-different")
+    backend.upload(video)
+
+    assert len(gemini_recorder["uploads"]) == 2
+    assert len(list(cache_dir.glob("*.json"))) == 2
+
+
+def test_gemini_upload_reuploads_when_cache_file_is_corrupted(tmp_path, fake_client, gemini_recorder):
+    video = tmp_path / "v.mp4"
+    video.write_bytes(b"fake-content")
+    cache_dir = tmp_path / "uploads"
+    cache_dir.mkdir(parents=True)
+    digest = hash_file_content(video)
+    (cache_dir / f"{digest}.json").write_text("{not valid json", encoding="utf-8")
+    backend = GeminiBackend(client=fake_client, cache_dir=cache_dir)
+
+    info = backend.upload(video)
+
+    assert len(gemini_recorder["uploads"]) == 1  # 壊れたキャッシュはミス扱いで再アップロード
+    assert info["name"] == "files/abc"
+    # 再アップロード後は正しい内容で上書きされている
+    assert json.loads((cache_dir / f"{digest}.json").read_text(encoding="utf-8"))["name"] == "files/abc"
+
+
+def test_gemini_upload_reuploads_when_cache_shape_is_invalid(tmp_path, fake_client, gemini_recorder):
+    """JSON としては正しいが必要なキーが欠けている（形式不正）場合もキャッシュミス扱い。"""
+    video = tmp_path / "v.mp4"
+    video.write_bytes(b"fake-content")
+    cache_dir = tmp_path / "uploads"
+    cache_dir.mkdir(parents=True)
+    digest = hash_file_content(video)
+    (cache_dir / f"{digest}.json").write_text(json.dumps({"name": "files/abc"}), encoding="utf-8")
+    backend = GeminiBackend(client=fake_client, cache_dir=cache_dir)
+
+    backend.upload(video)
+
+    assert len(gemini_recorder["uploads"]) == 1
+
+
+def test_gemini_upload_cache_write_is_atomic_and_leaves_no_tmp_files(tmp_path, fake_client):
+    video = tmp_path / "v.mp4"
+    video.write_bytes(b"fake-content")
+    cache_dir = tmp_path / "uploads"
+    backend = GeminiBackend(client=fake_client, cache_dir=cache_dir)
+
+    backend.upload(video)
+
+    json_files = list(cache_dir.glob("*.json"))
+    assert len(json_files) == 1
+    assert not list(cache_dir.glob("*.tmp"))  # 一時ファイルが残らない
+
+
+class PollingFakeFiles(FakeFiles):
+    """upload/get のたびに指定した state を順番に返す（PROCESSING -> ACTIVE の遷移を模す）。"""
+
+    def __init__(self, recorder, states):
+        super().__init__(recorder)
+        self._states = list(states)
+
+    def upload(self, file):
+        self.recorder["uploads"].append(file)
+        return FakeFile(state=self._states.pop(0))
+
+    def get(self, name):
+        self.recorder["gets"].append(name)
+        return FakeFile(name=name, state=self._states.pop(0))
+
+
+def test_gemini_upload_polls_from_processing_to_active(tmp_path, monkeypatch, gemini_recorder):
+    monkeypatch.setattr("avs.backends.gemini.time.sleep", lambda _seconds: None)
+    video = tmp_path / "v.mp4"
+    video.write_bytes(b"fake-content")
+    client = FakeClient(gemini_recorder)
+    client.files = PollingFakeFiles(gemini_recorder, states=["PROCESSING", "PROCESSING", "ACTIVE"])
+    backend = GeminiBackend(client=client, cache_dir=tmp_path / "uploads")
+
+    info = backend.upload(video)
+
+    assert info["name"] == "files/abc"
+    assert len(gemini_recorder["uploads"]) == 1
+    assert gemini_recorder["gets"] == ["files/abc", "files/abc"]  # PROCESSING を2回ポーリング
+
+
+def test_gemini_upload_raises_on_failed_state(tmp_path, monkeypatch, gemini_recorder):
+    monkeypatch.setattr("avs.backends.gemini.time.sleep", lambda _seconds: None)
+    video = tmp_path / "v.mp4"
+    video.write_bytes(b"fake-content")
+    client = FakeClient(gemini_recorder)
+    client.files = PollingFakeFiles(gemini_recorder, states=["FAILED"])
+    backend = GeminiBackend(client=client, cache_dir=tmp_path / "uploads")
+
+    with pytest.raises(RuntimeError, match="失敗"):
+        backend.upload(video)
 
 
 def test_gemini_supports_flags(tmp_path, fake_client):

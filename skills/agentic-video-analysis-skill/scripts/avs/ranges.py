@@ -17,7 +17,7 @@ import re
 from pathlib import Path
 from typing import Any
 
-from avs.common import read_json, write_json
+from avs.common import read_json, safe_slug, write_json
 from avs.tiling import TileOptions, parse_timestamps, tile_one_range, tile_zoom
 
 
@@ -96,6 +96,23 @@ def merge_defaults(config: dict[str, Any], range_entry: dict[str, Any]) -> dict[
     return merged
 
 
+def _range_label_fallback(merged: dict[str, Any]) -> str:
+    """label 省略時のファイル名フォールバック（zoom / start_end）。"""
+    if merged.get("timestamps"):
+        return "zoom"
+    return f"{merged['start']}_{merged['end']}"
+
+
+def range_slug(merged: dict[str, Any]) -> str:
+    """range の label をファイル名として安全な slug にする（`safe_slug` 経由）。
+
+    元の `label` はここでは変更しない。ファイル名にだけ slug を使う。
+    """
+    fallback = _range_label_fallback(merged)
+    label = merged.get("label") or fallback
+    return safe_slug(str(label), fallback)
+
+
 def resolve_output_path(config: dict[str, Any], merged: dict[str, Any]) -> Path:
     if "output" in merged:
         output_path = Path(merged["output"]).expanduser()
@@ -104,13 +121,12 @@ def resolve_output_path(config: dict[str, Any], merged: dict[str, Any]) -> Path:
             output_dir = Path(config["output_dir"]).expanduser()
         else:
             output_dir = Path("output") / "agentic_tiles"
+        slug = range_slug(merged)
         if merged.get("timestamps"):
-            label = merged.get("label") or "zoom"
-            output_path = output_dir / f"{label}_zoom.jpg"
+            output_path = output_dir / f"{slug}_zoom.jpg"
         else:
-            label = merged.get("label") or f"{merged['start']}_{merged['end']}"
             fps = merged.get("fps", 1)
-            output_path = output_dir / f"{label}_fps{fps}.jpg"
+            output_path = output_dir / f"{slug}_fps{fps}.jpg"
     if not output_path.is_absolute():
         output_path = (Path.cwd() / output_path).resolve()
     return output_path
@@ -165,6 +181,22 @@ def make_range_options(
     return options
 
 
+def _check_range_slug_collisions(merged_entries: list[dict[str, Any]]) -> None:
+    """slug がファイル名を決める（= 明示 `output` が無い）エントリ同士の衝突を起動時に検出する。"""
+    seen: dict[str, dict[str, Any]] = {}
+    for merged in merged_entries:
+        if "output" in merged:
+            continue  # 明示 output は slug を使わないので対象外
+        slug = range_slug(merged)
+        if slug in seen:
+            raise RuntimeError(
+                f"range の label がファイル名で衝突します: slug={slug!r}"
+                f"（label={seen[slug].get('label')!r} と label={merged.get('label')!r}）。"
+                "label を分けてください"
+            )
+        seen[slug] = merged
+
+
 def run_config_mode(options: TileOptions) -> int:
     config_path = Path(options.config).expanduser().resolve()
     config = load_config(config_path)
@@ -176,11 +208,14 @@ def run_config_mode(options: TileOptions) -> int:
         range_entries = merge_range_entries(range_entries, options.overlap_threshold)
         print(f"範囲をマージ: {len(config['ranges'])} -> {len(range_entries)}")
 
+    merged_entries = [merge_defaults(config, entry) for entry in range_entries]
+    _check_range_slug_collisions(merged_entries)
+
     results: list[dict[str, Any]] = []
-    for index, range_entry in enumerate(range_entries):
-        merged = merge_defaults(config, range_entry)
+    for index, merged in enumerate(merged_entries):
         output_path = resolve_output_path(config, merged)
         label = merged.get("label")
+        slug = range_slug(merged)
         note = merged.get("note")
         is_zoom = bool(merged.get("timestamps"))
         timestamps = parse_timestamps_value(merged["timestamps"]) if is_zoom else None
@@ -196,6 +231,7 @@ def run_config_mode(options: TileOptions) -> int:
                 {
                     "index": index,
                     "label": label,
+                    "slug": slug,
                     "note": note,
                     "status": "dry_run",
                     "mode": "zoom" if is_zoom else "tile",
@@ -221,6 +257,7 @@ def run_config_mode(options: TileOptions) -> int:
                 {
                     "index": index,
                     "label": label,
+                    "slug": slug,
                     "note": note,
                     "status": "error",
                     "mode": "zoom" if is_zoom else "tile",
@@ -234,6 +271,7 @@ def run_config_mode(options: TileOptions) -> int:
             {
                 "index": index,
                 "label": label,
+                "slug": slug,
                 "note": note,
                 "status": "ok",
                 "mode": "zoom" if is_zoom else "tile",

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 
-from avs.common import BACKEND_ENV_NAMES, resolve_api_key
+from avs.common import BACKEND_ENV_NAMES, resolve_api_key, safe_slug
 
 
 @pytest.fixture(autouse=True)
@@ -88,3 +88,42 @@ def test_backend_env_names_mapping():
         "openrouter": "OPENROUTER_API_KEY",
         "gemini": "GEMINI_API_KEY",
     }
+
+
+# --- safe_slug -------------------------------------------------------------
+
+
+def test_safe_slug_keeps_alnum_and_japanese_text():
+    assert safe_slug("cand_a", "fallback") == "cand_a"
+    assert safe_slug("ボス戦_1", "fallback") == "ボス戦_1"
+
+
+def test_safe_slug_replaces_unsafe_chars_and_control_chars():
+    assert safe_slug('a/b\\c:d*e?f"g<h>i|j', "fallback") == "a_b_c_d_e_f_g_h_i_j"
+    assert safe_slug("a\x00b\x1fc", "fallback") == "a_b_c"
+
+
+def test_safe_slug_strips_leading_trailing_whitespace_and_dots():
+    assert safe_slug("  .cand_a.  ", "fallback") == "cand_a"
+    assert safe_slug("...", "fallback") == "fallback"
+
+
+def test_safe_slug_windows_reserved_names_get_trailing_underscore():
+    for name in ("CON", "con", "Prn", "AUX", "NUL", "COM1", "com9", "LPT1", "lpt9"):
+        assert safe_slug(name, "fallback") == f"{name}_"
+    # 予約名でない語は変えない
+    assert safe_slug("COM10", "fallback") == "COM10"
+    assert safe_slug("COMPANY", "fallback") == "COMPANY"
+
+
+def test_safe_slug_empty_or_none_uses_fallback():
+    assert safe_slug("", "fallback") == "fallback"
+    assert safe_slug(None, "fallback") == "fallback"
+    assert safe_slug("   ", "fallback") == "fallback"
+
+
+def test_safe_slug_truncates_to_80_chars():
+    long_label = "a" * 200
+    slug = safe_slug(long_label, "fallback")
+    assert len(slug) == 80
+    assert slug == "a" * 80

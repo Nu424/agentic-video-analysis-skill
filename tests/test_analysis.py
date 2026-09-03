@@ -611,6 +611,52 @@ def test_collect_clip_jobs_rejects_colliding_output(tmp_path):
         )
 
 
+def test_collect_clip_jobs_slugifies_unsafe_labels_but_keeps_original_label(tmp_path):
+    """ファイル名は slug 化されるが、job.label（JSON 上の label）は元のまま。"""
+    config_path = tmp_path / "ranges.json"
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"fake")
+    config_path.write_text(
+        json.dumps(
+            {
+                "video": str(video),
+                "output_dir": str(tmp_path / "out"),
+                "defaults": {"fps": 5},
+                "ranges": [{"label": "Boss/Fight:1", "start": 0.0, "end": 2.0}],
+            }
+        ),
+        encoding="utf-8",
+    )
+    jobs = collect_clip_jobs(default_options(ranges=str(config_path)))
+
+    assert jobs[0].label == "Boss/Fight:1"  # 元のラベルはそのまま
+    assert jobs[0].base == (tmp_path / "out" / "Boss_Fight_1_analysis").resolve()  # ファイル名は slug
+
+
+def test_collect_clip_jobs_rejects_colliding_slugified_output(tmp_path):
+    """slug 化すると衝突する別ラベルは起動時にエラーにする。"""
+    config_path = tmp_path / "ranges.json"
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"fake")
+    config_path.write_text(
+        json.dumps(
+            {
+                "video": str(video),
+                "output_dir": str(tmp_path / "out"),
+                "defaults": {"fps": 5},
+                "ranges": [
+                    {"label": "cand/a", "start": 0.0, "end": 2.0},
+                    {"label": "cand:a", "start": 5.0, "end": 7.0},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    with pytest.raises(RuntimeError, match="出力先が衝突します"):
+        collect_clip_jobs(default_options(ranges=str(config_path)))
+
+
 def test_run_analysis_rejects_mixing_tile_and_native_inputs(tmp_path, monkeypatch):
     config_path, _video = make_ranges_config(tmp_path)
     prompt = tmp_path / "detail.txt"
@@ -841,3 +887,134 @@ def test_run_analysis_auto_attaches_session_found_from_output_dir(tmp_path, monk
 
     assert options.session == str(session.root)
     assert session.usage_path.exists()
+
+
+# --- P3 プロンプト配線: --domain / --strict-json / {{SCHEMA}} -------------------
+
+
+def test_run_analysis_domain_option_adds_domain_guide_to_prompt(tmp_path, monkeypatch):
+    manifest_path = make_manifest(tmp_path, tile_count=1)
+    domain_path = tmp_path / "domain.json"
+    domain_path.write_text(
+        json.dumps(
+            {
+                "name": "テストゲーム",
+                "description": "テストドメインの説明",
+                "watchlist": ["HPバーの増減"],
+            }
+        ),
+        encoding="utf-8",
+    )
+    backend = FakeBackend()
+    monkeypatch.setattr("avs.analysis.build_backend", lambda options: backend)
+    prompt = tmp_path / "detail.txt"
+    prompt.write_text("本文", encoding="utf-8")
+
+    options = default_options(
+        manifest=[str(manifest_path)],
+        prompt=str(prompt),
+        domain=str(domain_path),
+        output_dir=str(tmp_path / "out"),
+    )
+    assert run_analysis(options) == 0
+
+    sent_prompt = backend.requests[0].prompt
+    assert "## ドメインの手引き" in sent_prompt
+    assert "テストドメインの説明" in sent_prompt
+    assert "HPバーの増減" in sent_prompt
+
+
+def test_run_analysis_without_domain_option_omits_domain_guide(tmp_path, monkeypatch):
+    manifest_path = make_manifest(tmp_path, tile_count=1)
+    backend = FakeBackend()
+    monkeypatch.setattr("avs.analysis.build_backend", lambda options: backend)
+    prompt = tmp_path / "detail.txt"
+    prompt.write_text("本文", encoding="utf-8")
+
+    options = default_options(
+        manifest=[str(manifest_path)], prompt=str(prompt), output_dir=str(tmp_path / "out")
+    )
+    assert run_analysis(options) == 0
+    assert "## ドメインの手引き" not in backend.requests[0].prompt
+
+
+def test_run_analysis_strict_json_gates_llm_request_json_schema(tmp_path, monkeypatch):
+    manifest_path = make_manifest(tmp_path, tile_count=1)
+    prompt = tmp_path / "overview.txt"  # stem が既知のスキーマ名と一致する
+    prompt.write_text("本文 {{SCHEMA}}", encoding="utf-8")
+
+    backend_without = FakeBackend()
+    monkeypatch.setattr("avs.analysis.build_backend", lambda options: backend_without)
+    options_without = default_options(
+        manifest=[str(manifest_path)], prompt=str(prompt), output_dir=str(tmp_path / "out1")
+    )
+    assert run_analysis(options_without) == 0
+    assert backend_without.requests[0].json_schema is None  # --strict-json 無しでは None
+
+    backend_with = FakeBackend()
+    monkeypatch.setattr("avs.analysis.build_backend", lambda options: backend_with)
+    options_with = default_options(
+        manifest=[str(manifest_path)],
+        prompt=str(prompt),
+        output_dir=str(tmp_path / "out2"),
+        strict_json=True,
+    )
+    assert run_analysis(options_with) == 0
+    schema = backend_with.requests[0].json_schema
+    assert schema is not None
+    assert schema["type"] == "object"
+    assert "examples" not in json.dumps(schema)  # api_schema() で examples は落ちる
+
+
+def test_run_analysis_strict_json_without_known_schema_stays_none(tmp_path, monkeypatch):
+    """未知のプロンプト名（自作プロンプト）では --strict-json でも json_schema は None のまま。"""
+    manifest_path = make_manifest(tmp_path, tile_count=1)
+    backend = FakeBackend()
+    monkeypatch.setattr("avs.analysis.build_backend", lambda options: backend)
+    prompt = tmp_path / "my_custom_prompt.txt"
+    prompt.write_text("本文", encoding="utf-8")
+
+    options = default_options(
+        manifest=[str(manifest_path)],
+        prompt=str(prompt),
+        output_dir=str(tmp_path / "out"),
+        strict_json=True,
+    )
+    assert run_analysis(options) == 0
+    assert backend.requests[0].json_schema is None
+
+
+def test_run_analysis_warns_when_unknown_prompt_has_schema_placeholder(tmp_path, monkeypatch, capsys):
+    manifest_path = make_manifest(tmp_path, tile_count=1)
+    backend = FakeBackend()
+    monkeypatch.setattr("avs.analysis.build_backend", lambda options: backend)
+    prompt = tmp_path / "my_custom_prompt.txt"
+    prompt.write_text("本文 {{SCHEMA}}", encoding="utf-8")
+
+    options = default_options(
+        manifest=[str(manifest_path)], prompt=str(prompt), output_dir=str(tmp_path / "out")
+    )
+    assert run_analysis(options) == 0
+
+    out = capsys.readouterr().out
+    assert "[警告]" in out
+    assert "{{SCHEMA}}" in out
+    # 未知の stem なので置換されず本文にそのまま残る
+    assert "{{SCHEMA}}" in backend.requests[0].prompt
+
+
+def test_run_analysis_real_prompt_schema_placeholder_is_fully_substituted(tmp_path, monkeypatch):
+    """実プロンプト（overview.txt）経由で {{SCHEMA}} が置換され、プレースホルダが残らない。"""
+    manifest_path = make_manifest(tmp_path, tile_count=1)
+    backend = FakeBackend()
+    monkeypatch.setattr("avs.analysis.build_backend", lambda options: backend)
+    repo_root = Path(__file__).resolve().parents[1]
+    prompt = repo_root / "skills" / "agentic-video-analysis-skill" / "prompts" / "overview.txt"
+    assert prompt.exists()
+
+    options = default_options(
+        manifest=[str(manifest_path)], prompt=str(prompt), output_dir=str(tmp_path / "out")
+    )
+    assert run_analysis(options) == 0
+
+    assert "{{" not in backend.requests[0].prompt

@@ -20,6 +20,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import os
 import tempfile
 import threading
 import time
@@ -35,8 +36,21 @@ ENV_NAME = "GEMINI_API_KEY"
 DEFAULT_MODEL = "gemini-3.7-flash"
 UPLOAD_POLL_SEC = 2.0
 UPLOAD_TIMEOUT_SEC = 600.0
+HASH_CHUNK_SIZE = 1024 * 1024  # 1MB チャンクでストリーミング読み込み
 
 _upload_lock = threading.Lock()
+
+# アップロードキャッシュのエントリとして最低限必要なキー
+_REQUIRED_CACHE_KEYS = ("name", "uri", "mime_type", "video")
+
+
+def hash_file_content(path: Path) -> str:
+    """ファイル内容の SHA-1（1MB チャンクでストリーミング）。キャッシュキーに使う。"""
+    digest = hashlib.sha1()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(HASH_CHUNK_SIZE), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _import_genai() -> Any:
@@ -111,14 +125,13 @@ class GeminiBackend:
 
     def upload(self, video: Path) -> dict[str, Any]:
         video = Path(video).expanduser().resolve()
-        digest = hashlib.sha1(str(video).encode("utf-8")).hexdigest()
+        digest = hash_file_content(video)
         cache_path = self.cache_dir / f"{digest}.json"
 
         with _upload_lock:
-            if cache_path.exists():
-                info = json.loads(cache_path.read_text(encoding="utf-8"))
-                if self._is_active(info.get("name")):
-                    return info
+            info = self._read_cache(cache_path)
+            if info is not None and self._is_active(info.get("name")):
+                return info
 
             uploaded = self.client.files.upload(file=str(video))
             uploaded = self._wait_active(uploaded)
@@ -128,9 +141,37 @@ class GeminiBackend:
                 "mime_type": uploaded.mime_type,
                 "video": str(video),
             }
-            cache_path.parent.mkdir(parents=True, exist_ok=True)
-            cache_path.write_text(json.dumps(info, ensure_ascii=False, indent=2), encoding="utf-8")
+            self._write_cache(cache_path, info)
             return info
+
+    def _read_cache(self, cache_path: Path) -> dict[str, Any] | None:
+        """キャッシュを読む。壊れている／形式不正ならキャッシュミス扱いで None を返す。"""
+        if not cache_path.exists():
+            return None
+        try:
+            info = json.loads(cache_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(info, dict) or not all(info.get(key) for key in _REQUIRED_CACHE_KEYS):
+            return None
+        return info
+
+    def _write_cache(self, cache_path: Path, info: dict[str, Any]) -> None:
+        """一時ファイルに書いてから `os.replace` で原子的に置き換える。"""
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(
+            dir=str(cache_path.parent), prefix=f".{cache_path.name}.", suffix=".tmp"
+        )
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                handle.write(json.dumps(info, ensure_ascii=False, indent=2))
+            os.replace(tmp_name, cache_path)
+        except BaseException:
+            try:
+                os.remove(tmp_name)
+            except OSError:
+                pass
+            raise
 
     def _is_active(self, name: str | None) -> bool:
         if not name:

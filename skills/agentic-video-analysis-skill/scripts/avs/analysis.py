@@ -35,14 +35,18 @@ from pathlib import Path
 from typing import Any
 
 from avs.backends import LLMRequest, Media, MediaImage, MediaVideoClip, describe_media, get_backend
-from avs.common import format_float_for_path, probe_duration_sec, read_json, write_json
+from avs.common import format_float_for_path, probe_duration_sec, read_json, safe_slug, write_json
 from avs.cost import estimate_cost_usd, sum_usage
 from avs.prompts import (
     DEFAULT_OBJECTIVE,
+    SCHEMA_PLACEHOLDER,
+    api_schema,
     assemble_prompt,
     build_clip_context,
     build_tile_context,
+    load_domain,
     resolve_text_arg,
+    schema_for_prompt,
 )
 from avs.session import Session
 
@@ -71,6 +75,7 @@ class AnalyzeOptions:
     output_dir: str | None = None
     objective: str | None = None
     context: str | None = None
+    domain: str | None = None
     expect_json: bool = True  # CLI は --raw で False にする
     max_tiles_per_call: int = DEFAULT_MAX_TILES_PER_CALL
     jobs: int = 1
@@ -321,6 +326,7 @@ def _run_call(
     prompt_text: str,
     retry_prompt: str,
     media: list[Media],
+    json_schema: dict[str, Any] | None = None,
 ) -> tuple[Any | None, bool]:
     """1 回分の呼び出し。JSON が不正なら 1 回だけリトライする。(parsed, json_ok) を返す。"""
     ext = ".raw.txt" if options.expect_json else ".txt"
@@ -329,7 +335,7 @@ def _run_call(
 
     responses = [
         backend.complete(
-            LLMRequest(prompt=prompt_text, media=media, json_schema=None, model=options.model)
+            LLMRequest(prompt=prompt_text, media=media, json_schema=json_schema, model=options.model)
         )
     ]
     raw_text_path.write_text(responses[-1].text, encoding="utf-8")
@@ -344,7 +350,7 @@ def _run_call(
         )
         responses.append(
             backend.complete(
-                LLMRequest(prompt=retry_prompt, media=media, json_schema=None, model=options.model)
+                LLMRequest(prompt=retry_prompt, media=media, json_schema=json_schema, model=options.model)
             )
         )
         raw_text_path.write_text(responses[-1].text, encoding="utf-8")
@@ -373,12 +379,15 @@ def analyze_one(
     note: str | None,
     backend: Any,
     base: Path,
+    domain: dict[str, Any] | None = None,
+    schema: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     output_path = primary_output_path(base, options.expect_json)
     if output_path.exists() and not options.force and not options.dry_run:
         log(f"[スキップ] 既存: {output_path}")
         return {"manifest": str(manifest_path), "json_failures": 0, "parts": 0, "skipped": True}
 
+    json_schema = api_schema(schema) if options.strict_json else None
     manifest, manifest_dir = load_manifest(manifest_path)
     tiles = manifest["tiles"]
     tile_paths = [resolve_tile_path(manifest_dir, tile) for tile in tiles]
@@ -406,7 +415,9 @@ def analyze_one(
 
         # 出力先: 単一パートは base 直下、複数パートは _partNN
         part_suffix = "" if part_count == 1 else f"_part{part_index:02d}"
-        prompt_text = assemble_prompt(prompt_body, objective, tile_context, context_text, note)
+        prompt_text = assemble_prompt(
+            prompt_body, objective, tile_context, context_text, note, domain=domain, schema=schema
+        )
         media: list[Media] = [MediaImage(path=path) for path in chunk_paths]
 
         if options.dry_run:
@@ -422,10 +433,17 @@ def analyze_one(
             continue
 
         retry_prompt = assemble_prompt(
-            prompt_body, objective, tile_context, context_text, note, retry_hint=True
+            prompt_body,
+            objective,
+            tile_context,
+            context_text,
+            note,
+            retry_hint=True,
+            domain=domain,
+            schema=schema,
         )
         parsed, json_ok = _run_call(
-            backend, options, base, part_suffix, prompt_text, retry_prompt, media
+            backend, options, base, part_suffix, prompt_text, retry_prompt, media, json_schema
         )
         if options.expect_json and not json_ok:
             json_failures += 1
@@ -474,15 +492,20 @@ def analyze_clip(
     objective: str,
     context_text: str | None,
     backend: Any,
+    domain: dict[str, Any] | None = None,
+    schema: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     output_path = primary_output_path(job.base, options.expect_json)
     if output_path.exists() and not options.force and not options.dry_run:
         log(f"[スキップ] 既存: {output_path}")
         return {"label": job.label, "json_failures": 0, "parts": 0, "skipped": True}
 
+    json_schema = api_schema(schema) if options.strict_json else None
     job.base.parent.mkdir(parents=True, exist_ok=True)
     clip_context = build_clip_context(job.start_sec, job.end_sec, job.fps)
-    prompt_text = assemble_prompt(prompt_body, objective, clip_context, context_text, job.note)
+    prompt_text = assemble_prompt(
+        prompt_body, objective, clip_context, context_text, job.note, domain=domain, schema=schema
+    )
     media: list[Media] = [
         MediaVideoClip(
             video=job.video,
@@ -498,9 +521,18 @@ def analyze_clip(
 
     log(f"[開始] range {job.label} ({job.start_sec:.1f}s-{job.end_sec:.1f}s) -> {job.base}.*")
     retry_prompt = assemble_prompt(
-        prompt_body, objective, clip_context, context_text, job.note, retry_hint=True
+        prompt_body,
+        objective,
+        clip_context,
+        context_text,
+        job.note,
+        retry_hint=True,
+        domain=domain,
+        schema=schema,
     )
-    _, json_ok = _run_call(backend, options, job.base, "", prompt_text, retry_prompt, media)
+    _, json_ok = _run_call(
+        backend, options, job.base, "", prompt_text, retry_prompt, media, json_schema
+    )
     json_failures = 0 if json_ok or not options.expect_json else 1
     log(f"[完了] range {job.label}" + ("  JSON失敗1件" if json_failures else ""))
     return {"label": job.label, "json_failures": json_failures, "parts": 1}
@@ -544,7 +576,9 @@ def collect_clip_jobs(options: AnalyzeOptions) -> list[ClipJob]:
             end = float(merged["end"]) + pad
             if duration is not None:
                 end = min(end, duration)
-            label = str(merged.get("label") or f"range_{index:02d}")
+            fallback_label = f"range_{index:02d}"
+            label = str(merged.get("label") or fallback_label)
+            slug = safe_slug(label, fallback_label)
             jobs.append(
                 ClipJob(
                     label=label,
@@ -553,7 +587,7 @@ def collect_clip_jobs(options: AnalyzeOptions) -> list[ClipJob]:
                     end_sec=end,
                     fps=float(merged.get("fps", DEFAULT_CLIP_FPS)),
                     note=merged.get("note"),
-                    base=_clip_output_base(options, config_output_dir, label),
+                    base=_clip_output_base(options, config_output_dir, slug),
                 )
             )
         if not jobs:
@@ -773,6 +807,14 @@ def run_analysis(options: AnalyzeOptions) -> int:
     objective = resolve_text_arg(options.objective) or DEFAULT_OBJECTIVE
     context_text = resolve_text_arg(options.context)
 
+    domain = load_domain(options.domain) if options.domain else None
+    schema = schema_for_prompt(prompt_path)
+    if schema is None and SCHEMA_PLACEHOLDER in prompt_body:
+        log(
+            f"[警告] {prompt_path.name} は既知のプロンプト名でないため "
+            f"{SCHEMA_PLACEHOLDER} を置換できません"
+        )
+
     _attach_session_if_found(options)
     backend = build_backend(options)
     native = bool(options.ranges or options.video)
@@ -795,7 +837,9 @@ def run_analysis(options: AnalyzeOptions) -> int:
         )
 
         def clip_worker(job: ClipJob) -> dict[str, Any]:
-            return analyze_clip(job, options, prompt_body, objective, context_text, backend)
+            return analyze_clip(
+                job, options, prompt_body, objective, context_text, backend, domain=domain, schema=schema
+            )
 
         outcomes = _run_jobs(clip_jobs, clip_worker, options.jobs)
         if clip_jobs and not options.dry_run:
@@ -826,7 +870,16 @@ def run_analysis(options: AnalyzeOptions) -> int:
     def tile_worker(job: tuple[Path, str | None, Path]) -> dict[str, Any]:
         manifest_path, note, base = job
         return analyze_one(
-            manifest_path, options, prompt_body, objective, context_text, note, backend, base
+            manifest_path,
+            options,
+            prompt_body,
+            objective,
+            context_text,
+            note,
+            backend,
+            base,
+            domain=domain,
+            schema=schema,
         )
 
     outcomes = _run_jobs(tile_jobs, tile_worker, options.jobs)

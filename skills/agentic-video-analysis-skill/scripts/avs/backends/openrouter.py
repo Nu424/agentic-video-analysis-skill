@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import time
 import urllib.error
 import urllib.request
@@ -185,6 +186,21 @@ def _extract_text(data: dict[str, Any]) -> str:
     return content or ""
 
 
+def _normalize_cost(value: Any) -> float | None:
+    """OpenRouter の `usage.cost` を float に正規化する。
+
+    変換できない値や有限でない値（NaN / inf）は None にする
+    （cost.py の単価表フォールバックに委ねるため）。
+    """
+    if value is None:
+        return None
+    try:
+        cost = float(value)
+    except (TypeError, ValueError):
+        return None
+    return cost if math.isfinite(cost) else None
+
+
 def _normalize_usage(raw: dict[str, Any]) -> dict[str, Any]:
     details = raw.get("completion_tokens_details") or {}
     return make_usage(
@@ -192,6 +208,6 @@ def _normalize_usage(raw: dict[str, Any]) -> dict[str, Any]:
         output_tokens=raw.get("completion_tokens") or 0,
         reasoning_tokens=details.get("reasoning_tokens") or 0,
         total_tokens=raw.get("total_tokens") or 0,
-        cost_usd=raw.get("cost"),
+        cost_usd=_normalize_cost(raw.get("cost")),
         raw=raw,
     )

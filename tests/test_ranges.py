@@ -17,6 +17,7 @@ from avs.ranges import (
     overlap_ratio,
     parse_timestamps_value,
     plan_full_coverage,
+    range_slug,
     resolve_output_path,
     run_config_mode,
 )
@@ -124,6 +125,122 @@ def test_resolve_output_path_explicit_output_wins(tmp_path):
     config = {"output_dir": str(tmp_path / "ignored")}
     merged = {"output": str(tmp_path / "explicit.jpg"), "start": 0, "end": 1}
     assert resolve_output_path(config, merged) == tmp_path / "explicit.jpg"
+
+
+# --- label のファイル名 slug 化 --------------------------------------------------
+
+
+def test_range_slug_uses_label_when_present():
+    assert range_slug({"label": "cand_a", "start": 0, "end": 1}) == "cand_a"
+
+
+def test_range_slug_falls_back_to_start_end_without_label():
+    assert range_slug({"start": 4, "end": 9}) == "4_9"
+
+
+def test_range_slug_falls_back_to_zoom_for_zoom_range_without_label():
+    assert range_slug({"timestamps": [3.5, 7.0]}) == "zoom"
+
+
+def test_resolve_output_path_sanitizes_unsafe_label(tmp_path):
+    config = {"output_dir": str(tmp_path / "cand")}
+    merged = {"label": "Boss/Fight:1", "start": 4, "end": 9, "fps": 5}
+    output = resolve_output_path(config, merged)
+    assert output.name == "Boss_Fight_1_fps5.jpg"
+
+
+def test_resolve_output_path_keeps_original_label_safe_labels_unchanged(tmp_path):
+    # 既に安全なラベルは slug 化しても変わらない（既存の命名との後方互換）
+    config = {"output_dir": str(tmp_path / "cand")}
+    merged = {"label": "cand_a", "start": 4, "end": 9, "fps": 5}
+    assert resolve_output_path(config, merged).name == "cand_a_fps5.jpg"
+
+
+def test_run_config_mode_records_original_label_and_slug(tmp_path, monkeypatch):
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"fake")
+    summary_path = tmp_path / "batch_summary.json"
+    config_path = tmp_path / "ranges.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "video": str(video),
+                "output_dir": str(tmp_path / "out"),
+                "defaults": {"fps": 1},
+                "ranges": [{"label": "Boss/Fight:1", "start": 0, "end": 2}],
+                "summary_output": str(summary_path),
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "avs.ranges.tile_one_range",
+        lambda options: {"output": "out.jpg", "manifest_path": str(tmp_path / "out" / "manifest.json")},
+    )
+
+    assert run_config_mode(TileOptions(config=str(config_path))) == 0
+
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    entry = summary["results"][0]
+    # 元の label は JSON 上でそのまま保持し、slug はファイル名用に別で持つ
+    assert entry["label"] == "Boss/Fight:1"
+    assert entry["slug"] == "Boss_Fight_1"
+
+
+def test_run_config_mode_rejects_colliding_slugs_at_startup(tmp_path, monkeypatch):
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"fake")
+    config_path = tmp_path / "ranges.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "video": str(video),
+                "output_dir": str(tmp_path / "out"),
+                "defaults": {"fps": 1},
+                # 別々のラベルでも slug 化すると衝突する
+                "ranges": [
+                    {"label": "cand/a", "start": 0, "end": 2},
+                    {"label": "cand:a", "start": 5, "end": 7},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    calls: list[int] = []
+    monkeypatch.setattr(
+        "avs.ranges.tile_one_range", lambda options: calls.append(1) or {"output": "x", "manifest_path": "y"}
+    )
+
+    with pytest.raises(RuntimeError, match="衝突します"):
+        run_config_mode(TileOptions(config=str(config_path)))
+    assert calls == []  # 起動時（範囲の処理を始める前）にエラーになる
+
+
+def test_run_config_mode_allows_colliding_slugs_when_output_is_explicit(tmp_path, monkeypatch):
+    """slug を使わない（output を明示した）エントリ同士は衝突検査の対象外。"""
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"fake")
+    config_path = tmp_path / "ranges.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "video": str(video),
+                "defaults": {"fps": 1},
+                "ranges": [
+                    {"label": "cand/a", "start": 0, "end": 2, "output": str(tmp_path / "x1.jpg")},
+                    {"label": "cand:a", "start": 5, "end": 7, "output": str(tmp_path / "x2.jpg")},
+                ],
+                "summary_output": str(tmp_path / "batch_summary.json"),
+            }
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(
+        "avs.ranges.tile_one_range",
+        lambda options: {"output": "out.jpg", "manifest_path": str(tmp_path / "manifest.json")},
+    )
+
+    assert run_config_mode(TileOptions(config=str(config_path))) == 0
 
 
 # --- range オプション生成 ------------------------------------------------------

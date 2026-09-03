@@ -9,6 +9,7 @@
 - フォント読み込み (`load_font`)
 - JSON 読み書き (`read_json` / `write_json`)
 - APIキーの解決 (`resolve_api_key`)
+- ラベルのファイル名 slug 化 (`safe_slug`)
 """
 
 from __future__ import annotations
@@ -16,6 +17,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -205,6 +207,44 @@ def resolve_api_key(
         f"{target} には {env_name} が必要です。"
         "環境変数、カレントディレクトリの .env、~/.env.global の順に探しましたが見つかりませんでした"
     )
+
+
+# --- ラベルのファイル名 slug 化 -------------------------------------------------
+
+# `\ / : * ? " < > |` と制御文字（0x00-0x1F, 0x7F）を `_` に置換する
+_UNSAFE_FILENAME_CHARS_RE = re.compile(r'[\\/:*?"<>|\x00-\x1f\x7f]')
+
+# Windows の予約ファイル名（大小無視）。拡張子を除いた完全一致で判定する
+_WINDOWS_RESERVED_NAMES = {
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    *(f"COM{n}" for n in range(1, 10)),
+    *(f"LPT{n}" for n in range(1, 10)),
+}
+
+_SAFE_SLUG_MAX_LEN = 80
+
+
+def safe_slug(label: str, fallback: str) -> str:
+    """ラベルからファイル名の一部として安全な slug を作る。
+
+    - 英数字・日本語などの文字はそのまま保つ
+    - `\\/:*?"<>|` と制御文字は `_` に置換
+    - 先頭末尾の空白とドットを除去
+    - Windows 予約名（CON, PRN, AUX, NUL, COM1-9, LPT1-9。大小無視）は末尾に `_` を付ける
+    - 除去の結果空になったら `fallback` を使う
+    - 長さ 80 で切る
+    """
+    text = "" if label is None else str(label)
+    text = _UNSAFE_FILENAME_CHARS_RE.sub("_", text)
+    text = text.strip(" .")
+    if text.upper() in _WINDOWS_RESERVED_NAMES:
+        text = f"{text}_"
+    if not text:
+        text = fallback
+    return text[:_SAFE_SLUG_MAX_LEN]
 
 
 def read_json(path: Path) -> Any:
