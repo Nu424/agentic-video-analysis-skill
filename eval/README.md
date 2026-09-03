@@ -279,13 +279,17 @@ JSON スキーマで固定する。自由記述だと、採点が「書き方の
 
 ## 8. Step 5: 採点する
 
-`score.py` に、実行結果のタイムライン JSON と正解データを渡す。
+`score.py` に、実行結果のタイムライン JSON と正解データを渡す。入力は `timeline.json` /
+`timeline_union.json`（`timeline[]`）、`final.json` 形式（`result.timeline[]`）、detail の
+`*_analysis.json` / `*_validated.json`（`events[]`）のいずれでもよい（形状は自動判別する）。
 
 ```bash
 python eval/score.py <session>/merge/timeline.json --gt eval/fixtures/<name>/ground_truth.json
 ```
 
-（`score.py` の細かいオプションは未実装の部分がある。実装時に `--help` を参照）
+複数ファイルを渡すと各行 + 平均・標準偏差（標本 sd）を出す。`--session <session_dir>` で
+`usage.jsonl` からコストを集計、`--verbose` で見逃し・誤認・根拠なしの詳細とコスト内訳、
+`--json` で機械可読な出力にする（オプションの全体は `python eval/score.py --help` を参照）。
 
 最低限、次の 4 つを出す。
 
@@ -299,8 +303,11 @@ python eval/score.py <session>/merge/timeline.json --gt eval/fixtures/<name>/gro
 出力エントリ数は指標ではなく**参考値**。多いほど良いわけではない。網羅率と誤認数をセットで
 見る。
 
-トークンは内訳まで記録する。`input` / `tool_use` / `output` / `thinking` を分けておくと、
-「なぜ高いのか」が後から分かる。
+トークンは内訳まで記録する。`score.py --session` は `usage.jsonl` の
+`input_tokens` / `output_tokens` / `reasoning_tokens` / `total_tokens` をステップ別
+（overview / detail / zoom / refine / audio / merge / other）に分けて出す。実測 USD
+（`cost_usd_actual`）と概算 USD（`cost_usd_estimated`）は別集計にし、「なぜ高いのか」が
+後から分かるようにする。
 
 複数回実行した結果の**和集合網羅率**（どれか1回でも検出できた事象の割合）は
 `union_recall.py` で見る。
@@ -308,6 +315,10 @@ python eval/score.py <session>/merge/timeline.json --gt eval/fixtures/<name>/gro
 ```bash
 python eval/union_recall.py --gt eval/fixtures/<name>/ground_truth.json <timeline1.json> <timeline2.json> ...
 ```
+
+各実行単独の網羅率の平均、2実行の全組み合わせの和集合網羅率（平均・最小・最大）、
+全実行のいずれも検出できなかった事象の一覧を出す（`--json` で機械可読。詳細は
+`python eval/union_recall.py --help` を参照）。
 
 先行検証では、同条件で複数回実行して和集合を取ると単発実行より網羅率が上がることを確認
 している。**見逃しは事象ごとにランダムに起きやすい**ため、複数回の和集合は有効な打ち手になる。
