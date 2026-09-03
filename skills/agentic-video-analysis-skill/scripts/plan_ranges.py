@@ -23,9 +23,7 @@ import sys
 from pathlib import Path
 
 from avs.common import configure_utf8_stdout, probe_duration_sec, read_json, write_json
-from avs.ranges import plan_full_coverage
-
-DEFAULT_FULL_COVERAGE_MAX_SEC = 600.0
+from avs.ranges import DEFAULT_FULL_COVERAGE_MAX_SEC, plan_full_coverage, resolve_coverage
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
@@ -77,12 +75,6 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         ),
     )
     return parser.parse_args(argv)
-
-
-def resolve_coverage(coverage: str, duration_sec: float, full_coverage_max_sec: float) -> str:
-    if coverage != "auto":
-        return coverage
-    return "full" if duration_sec <= full_coverage_max_sec else "priority"
 
 
 def main(argv: list[str]) -> int:

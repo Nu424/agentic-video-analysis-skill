@@ -6,7 +6,8 @@
 - `scan_next_actions`: セッション内の `*_analysis.json` / `*_validated.json` /
   `batch_summary.json` / `analysis_summary.json` を走査し、次アクション候補を挙げる
 - `estimate_cost`: `ranges/ranges.json` があれば、解析前の概算コストを出す
-- `build_report`: 上記をまとめて `session_report.py` に渡す dict を作る
+- `build_report`: 上記をまとめて dict を作る
+- `render_report_text`: `build_report` の dict を人が読むテキストにする（ドライバも同じものを出す）
 
 `session_report.py` はこのモジュールを呼ぶだけの薄い CLI。
 """
@@ -328,6 +329,74 @@ def estimate_cost(session_dir: Path, records: list[dict[str, Any]]) -> dict[str,
 
 
 # --- レポート組み立て ---------------------------------------------------------------
+
+
+def render_report_text(report: dict[str, Any]) -> str:
+    """`build_report` の dict を人が読むテキストにする（`session_report.py` とドライバが使う）。"""
+    usage = report["usage"]
+    next_actions = report["next_actions"]
+    estimate = report["estimate"]
+
+    lines = [f"# セッションレポート: {report['session']}", ""]
+
+    lines.append("## 呼び出しと使用量")
+    lines.append(f"- 呼び出し回数: {usage['calls']}")
+    tokens = usage["tokens"]
+    lines.append(
+        f"- トークン: input={tokens['input_tokens']} output={tokens['output_tokens']}"
+        f" reasoning={tokens['reasoning_tokens']} total={tokens['total_tokens']}"
+    )
+    note = "（概算を含む）" if usage["cost_has_estimate"] else "（実測）"
+    lines.append(
+        f"- コスト USD: 実測={usage['cost_usd_actual']:.4f}"
+        f" / 概算={usage['cost_usd_estimated']:.4f}"
+        f" / 合計={usage['cost_usd_total']:.4f} {note}"
+    )
+    if usage["unknown_cost_calls"]:
+        lines.append(f"- コスト不明の呼び出し: {usage['unknown_cost_calls']} 件（単価表に無いモデル）")
+    lines.append(f"- 所要時間(latency)合計: {usage['latency_sec']:.1f}s")
+
+    if usage["by_step"]:
+        lines.append("")
+        lines.append("## ステップ別")
+        for step, bucket in sorted(usage["by_step"].items()):
+            lines.append(
+                f"- {step}: 呼び出し{bucket['calls']}件"
+                f" / total_tokens={bucket['total_tokens']}"
+                f" / cost_usd={bucket['cost_usd']:.4f}"
+            )
+
+    lines.append("")
+    lines.append("## 次アクション候補")
+    lines.append(f"- confidence=low: {next_actions['low_confidence_count']} 件")
+    zoom_targets = next_actions["zoom_targets"]
+    lines.append(f"- zoom_targets: {len(zoom_targets)} 件")
+    for item in zoom_targets[:20]:
+        lines.append(f"  - t={item['timestamp_sec']}s ({item['file']})")
+    if len(zoom_targets) > 20:
+        lines.append(f"  - ...他 {len(zoom_targets) - 20} 件")
+    lines.append(f"- hypothesis_verdict=rejected: {len(next_actions['hypothesis_rejected'])} 件")
+    for path in next_actions["hypothesis_rejected"]:
+        lines.append(f"  - {path}")
+    lines.append(f"- 失敗した範囲: {len(next_actions['failed_ranges'])} 件")
+    for item in next_actions["failed_ranges"]:
+        lines.append(f"  - {item.get('label')}: {item.get('error')} ({item['file']})")
+    if next_actions["validated_flags_count"]:
+        lines.append(f"- validated flags 合計: {next_actions['validated_flags_count']} 件")
+
+    if estimate is not None:
+        lines.append("")
+        lines.append("## 事前見積もり（--estimate）")
+        lines.append(f"- 範囲数: {estimate['n_ranges']}")
+        lines.append(f"- 推定タイル数: {estimate['n_tiles_estimate']}")
+        measured = "実測平均" if estimate["tokens_are_measured"] else "仮定値"
+        lines.append(f"- 1タイルあたりトークン({measured}): {estimate['avg_tokens_per_tile']}")
+        lines.append(
+            f"- 概算コスト USD: {estimate['estimated_usd']:.4f}"
+            f"（{estimate['model_used_for_pricing']} の単価表より概算）"
+        )
+
+    return "\n".join(lines)
 
 
 def build_report(session: str | Path, do_estimate: bool = False) -> dict[str, Any]:

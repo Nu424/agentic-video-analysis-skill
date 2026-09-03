@@ -8,6 +8,7 @@
 - `make_range_options`: range エントリ -> `TileOptions`
 - `run_config_mode`: 全範囲を順にタイル化し `batch_summary.json` を書く（範囲単位で失敗を隔離）
 - `plan_full_coverage`: overview の候補から全区間カバーの range 計画を作る（純粋関数。tiling 非依存）
+- `resolve_coverage`: `--coverage auto` を動画長で full / priority に解決する
 """
 
 from __future__ import annotations
@@ -313,9 +314,23 @@ def run_config_mode(options: TileOptions) -> int:
 # 入力の candidates[] は overview 解析結果の `candidates`（P3 でスキーマが確定する）。
 # `start_sec` / `end_sec` だけを必須とし、他のキーは `.get` で寛容に読む。
 
+# `--coverage auto` の分岐点。これ以下なら full、超えたら priority（§4.3）
+DEFAULT_FULL_COVERAGE_MAX_SEC = 600.0
+
 _PRIORITY_RANK = {"high": 3, "medium": 2, "low": 1}
 _SLUG_RE = re.compile(r"[^a-zA-Z0-9]+")
 _COVERAGE_MODES = ("full", "priority", "high-only")
+
+
+def resolve_coverage(
+    coverage: str,
+    duration_sec: float,
+    full_coverage_max_sec: float = DEFAULT_FULL_COVERAGE_MAX_SEC,
+) -> str:
+    """`auto` を動画長で解決する（`full_coverage_max_sec` 以下なら full、超えたら priority）。"""
+    if coverage != "auto":
+        return coverage
+    return "full" if duration_sec <= full_coverage_max_sec else "priority"
 
 
 def _slugify(text: str | None, max_len: int = 24) -> str:
