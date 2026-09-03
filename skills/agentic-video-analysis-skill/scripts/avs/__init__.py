@@ -9,6 +9,5 @@ CLI（`scripts/*.py`）は引数解釈だけを行い、処理本体はこのパ
 - `analysis` : 解析本体（チャンク分割・JSON 抽出・パート統合・監査記録）
 - `backends` : LLM バックエンド（openrouter / gemini）
 - `cost`     : usage 正規化・単価表・コスト概算
+- `session`  : セッションディレクトリ（session.json / usage.jsonl）とレポート集計
 """
-
-__all__ = ["analysis", "backends", "common", "cost", "prompts", "ranges", "tiling"]

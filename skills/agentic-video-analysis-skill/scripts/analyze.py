@@ -32,7 +32,13 @@
   base.json / base.raw.txt      解析結果（--raw なら base.txt のみ）
   base.prompt.txt               実際に送ったプロンプト
   base.meta.json                backend / model / メディア / usage / cost / latency / retries
-  <session>/usage.jsonl         上記 + name を 1 行追記（--session 指定時）
+  <session>/usage.jsonl         上記 + name を 1 行追記（--session 指定時。省略時は出力先から自動検出）
+
+主要出力（base.json / --raw なら base.txt）が既に存在するジョブは既定でスキップする
+（--force で再解析）。範囲ごとに失敗を隔離して続行し、終了コードは既定では全件失敗のときだけ1
+（--strict で1件でも失敗したら1）。--summary 経由なら batch_summary.json の results[] に
+analysis_status / analysis_error を書き戻す。--ranges 経由なら output_dir 直下に
+analysis_summary.json（results[]{label,output,status,error?}）を書く。
 
 処理本体は avs/analysis.py（解析）、avs/backends/（バックエンド）、
 avs/prompts.py（プロンプト組み立て）にある。
@@ -147,7 +153,20 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--session",
         default=None,
-        help="セッションディレクトリ。指定すると <session>/usage.jsonl に呼び出し記録を追記する",
+        help=(
+            "セッションディレクトリ。指定すると <session>/usage.jsonl に呼び出し記録を追記する。"
+            "省略時は出力先から上方向に session.json を探し、見つかればそれを使う"
+        ),
+    )
+    parser.add_argument(
+        "--force",
+        action="store_true",
+        help="主要出力（<name>_analysis.json 等）が既に存在するジョブも再解析する（既定はスキップ）",
+    )
+    parser.add_argument(
+        "--strict",
+        action="store_true",
+        help="1件でも解析に失敗したら終了コード1にする（既定は全件失敗のときだけ1）",
     )
     parser.add_argument(
         "--max-tiles-per-call",

@@ -44,6 +44,7 @@ from avs.prompts import (
     build_tile_context,
     resolve_text_arg,
 )
+from avs.session import Session
 
 DEFAULT_MAX_TILES_PER_CALL = 8
 DEFAULT_BACKEND = "openrouter"
@@ -51,6 +52,7 @@ DEFAULT_CLIP_FPS = 5.0
 
 _print_lock = threading.Lock()
 _usage_lock = threading.Lock()
+_summary_lock = threading.Lock()
 
 
 def log(message: str) -> None:
@@ -77,6 +79,8 @@ class AnalyzeOptions:
     api_key: str | None = None
     strict_json: bool = False
     session: str | None = None
+    force: bool = False  # --force: 既存出力があっても再解析する
+    strict: bool = False  # --strict: 1件でも失敗したら終了コード1にする（既定は全件失敗のときだけ）
     # ネイティブ動画クリップ入力
     ranges: str | None = None
     video: str | None = None
@@ -355,6 +359,11 @@ def _run_call(
 # --- 1 manifest の解析 --------------------------------------------------------
 
 
+def primary_output_path(base: Path, expect_json: bool) -> Path:
+    """主要出力（`<base>.json` / raw モードは `<base>.txt`）のパス。"""
+    return base.with_suffix(".json" if expect_json else ".txt")
+
+
 def analyze_one(
     manifest_path: Path,
     options: AnalyzeOptions,
@@ -365,6 +374,11 @@ def analyze_one(
     backend: Any,
     base: Path,
 ) -> dict[str, Any]:
+    output_path = primary_output_path(base, options.expect_json)
+    if output_path.exists() and not options.force and not options.dry_run:
+        log(f"[スキップ] 既存: {output_path}")
+        return {"manifest": str(manifest_path), "json_failures": 0, "parts": 0, "skipped": True}
+
     manifest, manifest_dir = load_manifest(manifest_path)
     tiles = manifest["tiles"]
     tile_paths = [resolve_tile_path(manifest_dir, tile) for tile in tiles]
@@ -461,6 +475,11 @@ def analyze_clip(
     context_text: str | None,
     backend: Any,
 ) -> dict[str, Any]:
+    output_path = primary_output_path(job.base, options.expect_json)
+    if output_path.exists() and not options.force and not options.dry_run:
+        log(f"[スキップ] 既存: {output_path}")
+        return {"label": job.label, "json_failures": 0, "parts": 0, "skipped": True}
+
     job.base.parent.mkdir(parents=True, exist_ok=True)
     clip_context = build_clip_context(job.start_sec, job.end_sec, job.fps)
     prompt_text = assemble_prompt(prompt_body, objective, clip_context, context_text, job.note)
@@ -614,34 +633,135 @@ def collect_manifests(summary: str | None, manifests: list[str] | None) -> list[
 
 # --- 実行 ----------------------------------------------------------------------
 
+# 1 ジョブの実行結果: (job, result, error)。result は worker の戻り値（成功時）、
+# error は例外メッセージ（失敗時）。両方 None にはならない。
+JobOutcome = tuple[Any, dict[str, Any] | None, str | None]
 
-def _run_jobs(jobs: list[Any], worker: Any, jobs_count: int) -> int:
-    """worker を直列 or 並列で回し、JSON 失敗件数を返す。1 件でも失敗すれば例外。"""
-    failures: list[tuple[Any, str]] = []
-    json_failure_total = 0
+
+def _run_jobs(jobs: list[Any], worker: Any, jobs_count: int) -> list[JobOutcome]:
+    """worker を直列 or 並列で回す。個々の失敗は例外を握って結果に含め、続行する。"""
+
+    def run_one(job: Any) -> JobOutcome:
+        try:
+            return job, worker(job), None
+        except Exception as error:  # noqa: BLE001 - 個別に隔離してまとめて報告する
+            log(f"  失敗: {error}")
+            return job, None, str(error)
 
     if jobs_count == 1 or len(jobs) == 1:
-        for job in jobs:
-            try:
-                json_failure_total += worker(job)["json_failures"]
-            except Exception as error:  # noqa: BLE001 - まとめて報告するため継続
-                log(f"  失敗: {error}")
-                failures.append((job, str(error)))
+        outcomes = [run_one(job) for job in jobs]
     else:
         with ThreadPoolExecutor(max_workers=jobs_count) as executor:
-            future_map = {executor.submit(worker, job): job for job in jobs}
-            for future in as_completed(future_map):
-                try:
-                    json_failure_total += future.result()["json_failures"]
-                except Exception as error:  # noqa: BLE001
-                    log(f"  失敗: {error}")
-                    failures.append((future_map[future], str(error)))
+            futures = [executor.submit(run_one, job) for job in jobs]
+            outcomes = [future.result() for future in as_completed(futures)]
 
+    json_failure_total = sum(
+        result["json_failures"] for _, result, error in outcomes if result and not error
+    )
     if json_failure_total:
         log(f"JSON検証に失敗したパート: {json_failure_total} 件（生テキストは保存済み）")
+    return outcomes
+
+
+def _job_status(result: dict[str, Any] | None, error: str | None) -> str:
+    if error:
+        return "error"
+    if result and result.get("skipped"):
+        return "skipped"
+    return "ok"
+
+
+def _report_failures_and_decide_exit_code(
+    outcomes: list[JobOutcome], total: int, strict: bool
+) -> int:
+    failures = [(job, error) for job, _, error in outcomes if error]
     if failures:
-        raise RuntimeError(f"{len(failures)}/{len(jobs)} 件の解析に失敗しました")
+        log(f"{len(failures)}/{total} 件の解析に失敗しました")
+    if total == 0:
+        return 0
+    if strict and failures:
+        return 1
+    if len(failures) == total:
+        return 1
     return 0
+
+
+def _write_back_summary(summary_path: Path, outcomes_by_manifest: dict[Path, tuple[str, str | None]]) -> None:
+    """`--summary` の batch_summary.json の results[] に analysis_status / analysis_error を書き戻す。"""
+    with _summary_lock:
+        try:
+            summary_data = read_json(summary_path)
+        except (OSError, ValueError) as error:
+            log(f"  [警告] {summary_path} への書き戻しに失敗しました: {error}")
+            return
+        for result in summary_data.get("results", []):
+            manifest_path = result.get("manifest_path")
+            if not manifest_path:
+                continue
+            key = Path(manifest_path).expanduser().resolve()
+            outcome = outcomes_by_manifest.get(key)
+            if outcome is None:
+                continue
+            status, error = outcome
+            result["analysis_status"] = status
+            if error:
+                result["analysis_error"] = error
+            else:
+                result.pop("analysis_error", None)
+        write_json(summary_path, summary_data)
+    log(f"analysis status を書き戻し: {summary_path}")
+
+
+def _write_analysis_summary(
+    output_dir: Path, video: Path | None, outcomes: list[JobOutcome]
+) -> Path:
+    """`--ranges` 経路用: config 横に analysis_summary.json を書く（results[]{label,output,status,error?}）。"""
+    results = []
+    for job, result, error in outcomes:
+        status = _job_status(result, error)
+        entry: dict[str, Any] = {
+            "label": job.label,
+            "output": str(job.base.with_suffix(".json")),
+            "status": status,
+        }
+        if error:
+            entry["error"] = error
+        results.append(entry)
+    summary_path = output_dir / "analysis_summary.json"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    write_json(summary_path, {"video": str(video) if video else None, "results": results})
+    log(f"analysis summary: {summary_path}")
+    return summary_path
+
+
+def _probe_path_for_session(options: AnalyzeOptions) -> Path | None:
+    """`--session` 省略時にセッションを探す起点パス。出力先候補から順に選ぶ。"""
+    if options.output_dir:
+        return Path(options.output_dir).expanduser()
+    if options.output:
+        return Path(options.output).expanduser().parent
+    if options.summary:
+        return Path(options.summary).expanduser().parent
+    if options.manifest:
+        return Path(options.manifest[0]).expanduser().parent
+    if options.ranges:
+        return Path(options.ranges).expanduser().parent
+    if options.video:
+        return Path(options.video).expanduser().parent
+    return None
+
+
+def _attach_session_if_found(options: AnalyzeOptions) -> None:
+    """`--session` が省略されたとき、出力先から上方向に session.json を探して補う。"""
+    if options.session:
+        return
+    probe_path = _probe_path_for_session(options)
+    if probe_path is None:
+        return
+    session = Session.find(probe_path)
+    if session:
+        options.session = str(session.root)
+        log(f"[セッション] 検出: {session.root}")
 
 
 def run_analysis(options: AnalyzeOptions) -> int:
@@ -653,6 +773,7 @@ def run_analysis(options: AnalyzeOptions) -> int:
     objective = resolve_text_arg(options.objective) or DEFAULT_OBJECTIVE
     context_text = resolve_text_arg(options.context)
 
+    _attach_session_if_found(options)
     backend = build_backend(options)
     native = bool(options.ranges or options.video)
 
@@ -676,7 +797,10 @@ def run_analysis(options: AnalyzeOptions) -> int:
         def clip_worker(job: ClipJob) -> dict[str, Any]:
             return analyze_clip(job, options, prompt_body, objective, context_text, backend)
 
-        return _run_jobs(clip_jobs, clip_worker, options.jobs)
+        outcomes = _run_jobs(clip_jobs, clip_worker, options.jobs)
+        if clip_jobs and not options.dry_run:
+            _write_analysis_summary(clip_jobs[0].base.parent, clip_jobs[0].video, outcomes)
+        return _report_failures_and_decide_exit_code(outcomes, len(clip_jobs), options.strict)
 
     manifests = collect_manifests(options.summary, options.manifest)
     multiple = len(manifests) > 1
@@ -705,4 +829,10 @@ def run_analysis(options: AnalyzeOptions) -> int:
             manifest_path, options, prompt_body, objective, context_text, note, backend, base
         )
 
-    return _run_jobs(tile_jobs, tile_worker, options.jobs)
+    outcomes = _run_jobs(tile_jobs, tile_worker, options.jobs)
+    if options.summary and not options.dry_run:
+        outcomes_by_manifest = {
+            job[0]: (_job_status(result, error), error) for job, result, error in outcomes
+        }
+        _write_back_summary(Path(options.summary).expanduser().resolve(), outcomes_by_manifest)
+    return _report_failures_and_decide_exit_code(outcomes, len(tile_jobs), options.strict)

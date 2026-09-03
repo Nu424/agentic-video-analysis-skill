@@ -12,6 +12,8 @@ import pytest
 
 from avs.analysis import (
     AnalyzeOptions,
+    ClipJob,
+    analyze_clip,
     analyze_one,
     chunk_with_overlap,
     collect_clip_jobs,
@@ -24,6 +26,7 @@ from avs.analysis import (
 )
 from avs.backends.base import LLMResponse, MediaImage, MediaVideoClip
 from avs.cost import make_usage
+from avs.session import Session
 from avs.prompts import (
     OBJECTIVE_PLACEHOLDER,
     apply_objective,
@@ -623,3 +626,218 @@ def test_run_analysis_rejects_mixing_tile_and_native_inputs(tmp_path, monkeypatc
                 ranges=str(config_path), manifest=[str(manifest_path)], prompt=str(prompt)
             )
         )
+
+
+# --- 既存出力のスキップ / --force ------------------------------------------------
+
+
+def test_analyze_one_skips_when_output_already_exists(tmp_path):
+    manifest_path = make_manifest(tmp_path)
+    base = tmp_path / "cand_a_analysis"
+    base.with_suffix(".json").write_text('{"events": ["既存"]}', encoding="utf-8")
+    backend = FakeBackend()
+
+    report = analyze_one(manifest_path, default_options(), "本文", "目的", None, None, backend, base)
+
+    assert report.get("skipped") is True
+    assert backend.requests == []
+    # 既存の内容は書き換えられない
+    assert json.loads(base.with_suffix(".json").read_text(encoding="utf-8")) == {"events": ["既存"]}
+
+
+def test_analyze_one_force_reanalyzes_existing_output(tmp_path):
+    manifest_path = make_manifest(tmp_path)
+    base = tmp_path / "cand_a_analysis"
+    base.with_suffix(".json").write_text('{"events": ["既存"]}', encoding="utf-8")
+    backend = FakeBackend()
+
+    report = analyze_one(
+        manifest_path, default_options(force=True), "本文", "目的", None, None, backend, base
+    )
+
+    assert not report.get("skipped")
+    assert len(backend.requests) == 1
+    assert json.loads(base.with_suffix(".json").read_text(encoding="utf-8")) == {
+        "events": [{"title": "A"}]
+    }
+
+
+def test_analyze_clip_skips_when_output_already_exists(tmp_path):
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"fake")
+    base = tmp_path / "out" / "cand_a_analysis"
+    base.parent.mkdir(parents=True)
+    base.with_suffix(".json").write_text('{"events": ["既存"]}', encoding="utf-8")
+    backend = FakeBackend(supports_video_clip=True)
+    job = ClipJob(label="cand_a", video=video, start_sec=0.0, end_sec=4.0, fps=5.0, note=None, base=base)
+
+    report = analyze_clip(job, default_options(), "本文", "目的", None, backend)
+
+    assert report.get("skipped") is True
+    assert backend.requests == []
+
+
+# --- 失敗隔離とレジューム（run_analysis 経由の書き戻し） -------------------------
+
+
+def _write_raw_manifest(directory: Path, tile_filenames: list[str]) -> Path:
+    """タイル画像を実際には作らない manifest（resolve_tile_path が失敗するように）。"""
+    directory.mkdir(parents=True, exist_ok=True)
+    tiles = [
+        {
+            "tile_index": index,
+            "filename": name,
+            "start_timestamp_sec": float(index * 2),
+            "end_timestamp_sec": float(index * 2 + 1.5),
+            "start_frame": index * 4,
+            "end_frame": index * 4 + 3,
+        }
+        for index, name in enumerate(tile_filenames)
+    ]
+    manifest_path = directory / "manifest.json"
+    manifest_path.write_text(
+        json.dumps({"extraction": {"start_sec": 0.0, "end_sec": 4.0, "fps": 2}, "tiles": tiles}),
+        encoding="utf-8",
+    )
+    return manifest_path
+
+
+def test_run_analysis_continues_after_one_manifest_fails_and_writes_back_summary(
+    tmp_path, monkeypatch
+):
+    good_manifest = make_manifest(tmp_path / "good")
+    # 存在しないタイル画像を参照する manifest -> resolve_tile_path で RuntimeError
+    bad_manifest = _write_raw_manifest(tmp_path / "bad" / "cand_bad", ["missing.jpg"])
+
+    summary_path = tmp_path / "batch_summary.json"
+    summary_path.write_text(
+        json.dumps(
+            {
+                "results": [
+                    {"manifest_path": str(good_manifest), "note": None, "label": "good"},
+                    {"manifest_path": str(bad_manifest), "note": None, "label": "bad"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    backend = FakeBackend()
+    monkeypatch.setattr("avs.analysis.build_backend", lambda options: backend)
+    prompt = tmp_path / "detail.txt"
+    prompt.write_text("本文", encoding="utf-8")
+
+    options = default_options(summary=str(summary_path), prompt=str(prompt), output_dir=str(tmp_path / "out"))
+    assert run_analysis(options) == 0  # 1件失敗だが全滅ではないので0
+
+    summary = json.loads(summary_path.read_text(encoding="utf-8"))
+    statuses = {entry["label"]: entry["analysis_status"] for entry in summary["results"]}
+    assert statuses == {"good": "ok", "bad": "error"}
+    bad_entry = next(entry for entry in summary["results"] if entry["label"] == "bad")
+    assert "タイル画像が見つかりません" in bad_entry["analysis_error"]
+    good_entry = next(entry for entry in summary["results"] if entry["label"] == "good")
+    assert "analysis_error" not in good_entry
+
+
+def test_run_analysis_strict_returns_1_on_partial_failure(tmp_path, monkeypatch):
+    good_manifest = make_manifest(tmp_path / "good")
+    bad_manifest = _write_raw_manifest(tmp_path / "bad" / "cand_bad", ["missing.jpg"])
+    summary_path = tmp_path / "batch_summary.json"
+    summary_path.write_text(
+        json.dumps(
+            {
+                "results": [
+                    {"manifest_path": str(good_manifest), "note": None, "label": "good"},
+                    {"manifest_path": str(bad_manifest), "note": None, "label": "bad"},
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    backend = FakeBackend()
+    monkeypatch.setattr("avs.analysis.build_backend", lambda options: backend)
+    prompt = tmp_path / "detail.txt"
+    prompt.write_text("本文", encoding="utf-8")
+
+    options = default_options(
+        summary=str(summary_path), prompt=str(prompt), output_dir=str(tmp_path / "out"), strict=True
+    )
+    assert run_analysis(options) == 1
+
+
+def test_run_analysis_returns_1_when_all_manifests_fail(tmp_path, monkeypatch):
+    bad_manifest = _write_raw_manifest(tmp_path / "bad" / "cand_bad", ["missing.jpg"])
+    backend = FakeBackend()
+    monkeypatch.setattr("avs.analysis.build_backend", lambda options: backend)
+    prompt = tmp_path / "detail.txt"
+    prompt.write_text("本文", encoding="utf-8")
+
+    options = default_options(
+        manifest=[str(bad_manifest)], prompt=str(prompt), output_dir=str(tmp_path / "out")
+    )
+    assert run_analysis(options) == 1
+
+
+class FlakyBackend(FakeBackend):
+    """指定した呼び出し回数目だけ失敗するバックエンド（--ranges の失敗隔離テスト用）。"""
+
+    def __init__(self, fail_on_call: int, **kwargs):
+        super().__init__(**kwargs)
+        self.fail_on_call = fail_on_call
+        self.call_count = 0
+
+    def complete(self, request):
+        self.call_count += 1
+        if self.call_count == self.fail_on_call:
+            raise RuntimeError("api boom")
+        return super().complete(request)
+
+
+def test_run_analysis_ranges_isolates_failure_and_writes_analysis_summary(tmp_path, monkeypatch):
+    config_path, _video = make_ranges_config(tmp_path)
+    prompt = tmp_path / "detail.txt"
+    prompt.write_text("本文", encoding="utf-8")
+    backend = FlakyBackend(fail_on_call=1, supports_video_clip=True)
+    monkeypatch.setattr("avs.analysis.build_backend", lambda options: backend)
+
+    options = default_options(ranges=str(config_path), prompt=str(prompt))
+    assert run_analysis(options) == 0  # cand_a 失敗 / cand_b 成功。全滅ではない
+
+    summary = json.loads((tmp_path / "out" / "analysis_summary.json").read_text(encoding="utf-8"))
+    statuses = {entry["label"]: entry["status"] for entry in summary["results"]}
+    assert statuses == {"cand_a": "error", "cand_b": "ok"}
+    failed = next(entry for entry in summary["results"] if entry["label"] == "cand_a")
+    assert "api boom" in failed["error"]
+    assert (tmp_path / "out" / "cand_b_analysis.json").exists()
+
+
+def test_run_analysis_ranges_strict_returns_1_on_partial_failure(tmp_path, monkeypatch):
+    config_path, _video = make_ranges_config(tmp_path)
+    prompt = tmp_path / "detail.txt"
+    prompt.write_text("本文", encoding="utf-8")
+    backend = FlakyBackend(fail_on_call=1, supports_video_clip=True)
+    monkeypatch.setattr("avs.analysis.build_backend", lambda options: backend)
+
+    options = default_options(ranges=str(config_path), prompt=str(prompt), strict=True)
+    assert run_analysis(options) == 1
+
+
+# --- --session 省略時の自動検出 ---------------------------------------------------
+
+
+def test_run_analysis_auto_attaches_session_found_from_output_dir(tmp_path, monkeypatch):
+    session = Session.create(tmp_path / "sess", video=str(tmp_path / "video.mp4"), backend="openrouter")
+    manifest_path = make_manifest(tmp_path / "sess" / "ranges")
+    backend = FakeBackend()
+    monkeypatch.setattr("avs.analysis.build_backend", lambda options: backend)
+    prompt = tmp_path / "detail.txt"
+    prompt.write_text("本文", encoding="utf-8")
+
+    options = default_options(
+        manifest=[str(manifest_path)], prompt=str(prompt), output_dir=str(tmp_path / "sess" / "ranges")
+    )
+    assert options.session is None
+    assert run_analysis(options) == 0
+
+    assert options.session == str(session.root)
+    assert session.usage_path.exists()

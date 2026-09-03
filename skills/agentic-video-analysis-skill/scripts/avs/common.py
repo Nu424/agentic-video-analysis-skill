@@ -48,6 +48,7 @@ def run_command(args: list[str], label: str) -> str:
             check=False,
             capture_output=True,
             encoding="utf-8",
+            errors="replace",
         )
     except FileNotFoundError as exc:
         raise RuntimeError(f"{args[0]} が見つかりません。ffmpeg/ffprobeをインストールしてください") from exc
