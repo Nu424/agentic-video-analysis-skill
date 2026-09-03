@@ -9,6 +9,8 @@ import pytest
 
 import avs.merge as merge_module
 from avs.merge import (
+    LLM_DROPPED_FLAG,
+    LLM_UNMATCHED_FLAG,
     MergeOptions,
     attach_audio,
     collect_events,
@@ -18,6 +20,8 @@ from avs.merge import (
     merge_events,
     merge_diff,
     overlap_ratio,
+    pair_items,
+    reconcile_llm_timeline,
     render_final_md,
     run_merge,
     union_timelines,
@@ -362,7 +366,10 @@ def test_run_merge_with_llm_records_diff_and_usage(tmp_path, monkeypatch):
 
     doc = json.loads((session / "merge" / "timeline.json").read_text(encoding="utf-8"))
     assert doc["overview"] == "統合後の概要"
-    assert len(doc["timeline"]) == 1
+    # LLM が落とした 1 件は llm_dropped を付けて復元されるので 2 件になる
+    assert len(doc["timeline"]) == 2
+    restored = [item for item in doc["timeline"] if LLM_DROPPED_FLAG in item["flags"]]
+    assert [item["title"] for item in restored] == ["画面の暗転"]
 
     report = json.loads((session / "merge" / "validation_report.json").read_text(encoding="utf-8"))
     diff = report["merge_diff"]
@@ -374,8 +381,19 @@ def test_run_merge_with_llm_records_diff_and_usage(tmp_path, monkeypatch):
     usage_lines = (session / "usage.jsonl").read_text(encoding="utf-8").strip().splitlines()
     assert len(usage_lines) == 1
     record = json.loads(usage_lines[0])
-    assert record["name"] == "merge"
+    assert record["name"] == "merge_01"
+    assert record["step"] == "merge"
     assert record["usage"]["total_tokens"] == 150
+
+    # 監査記録（analysis と同じ形の meta.json と、送ったプロンプト）
+    assert (session / "merge" / "merge_01.prompt.txt").exists()
+    meta = json.loads((session / "merge" / "merge_01.meta.json").read_text(encoding="utf-8"))
+    assert meta["backend"] == "fake"
+    assert meta["step"] == "merge"
+    assert meta["media"] == []
+    assert meta["retries"] == 0
+    assert meta["prompt_chars"] > 0
+    assert meta["created_at"]
 
     prompt = backend.requests[0].prompt
     assert "テスト目的" in prompt
@@ -393,8 +411,13 @@ def test_llm_merge_retries_once_on_bad_json(tmp_path, monkeypatch):
     assert len(backend.requests) == 2
     # リトライ時はヒントが付く
     assert "コードフェンス付きJSON" in backend.requests[1].prompt
+    # usage は 1 チャンク 1 行（リトライ分は合算して retries に出す）
     usage_lines = (session / "usage.jsonl").read_text(encoding="utf-8").strip().splitlines()
-    assert len(usage_lines) == 2
+    assert len(usage_lines) == 1
+    record = json.loads(usage_lines[0])
+    assert record["retries"] == 1
+    assert record["usage"]["total_tokens"] == 300  # 2 回分の合算
+    assert (session / "merge" / "merge_01.retry.prompt.txt").exists()
 
 
 def test_llm_merge_splits_by_chunk(tmp_path, monkeypatch):
@@ -406,6 +429,9 @@ def test_llm_merge_splits_by_chunk(tmp_path, monkeypatch):
     assert run_merge(options) == 0
     # 機械統合の結果 2 件を 1 件ずつ 2 回に分けて送る
     assert len(backend.requests) == 2
+    # チャンクごとに監査記録が残る
+    assert (session / "merge" / "merge_01.meta.json").exists()
+    assert (session / "merge" / "merge_02.meta.json").exists()
 
 
 def test_merge_diff_detects_added_and_moved():
@@ -418,3 +444,140 @@ def test_merge_diff_detects_added_and_moved():
     assert diff["dropped"] == []
     assert [item["title"] for item in diff["added"]] == ["入力に無かった項目"]
     assert diff["moved"][0]["before"] == [9.0, 11.0]
+
+
+# --- 同じ出所の項目は統合しない（§4.6-1） ------------------------------------------
+
+
+def test_merge_events_does_not_merge_items_from_same_source():
+    """同じ範囲が挙げた同名・時間重なりの 2 件は、別の出来事として残す。"""
+    events = [
+        merge_module.normalize_event(event(9.0, 11.0, "数値の増加"), source="r1"),
+        merge_module.normalize_event(event(10.0, 12.0, "数値の増加"), source="r1"),
+    ]
+    merged = merge_events(events)
+    assert len(merged) == 2
+    assert all(item["sources"] == ["r1"] for item in merged)
+
+
+def test_merge_events_merges_only_across_different_sources():
+    """同一 source の 2 件は残しつつ、別 source の重複とは統合する。"""
+    events = [
+        merge_module.normalize_event(event(9.0, 11.0, "数値の増加"), source="r1"),
+        merge_module.normalize_event(event(9.5, 11.5, "数値の増加"), source="r1"),
+        merge_module.normalize_event(event(10.0, 12.0, "数値の増加"), source="r2"),
+    ]
+    merged = merge_events(events)
+    # r2 の 1 件は r1 のどちらか 1 件とだけ統合され、3 件 -> 2 件になる
+    assert len(merged) == 2
+    assert sorted(len(item["sources"]) for item in merged) == [1, 2]
+
+
+def test_union_timelines_does_not_merge_within_the_same_run(tmp_path):
+    """和集合では runs を見る（同じ実行の中の 2 件は統合しない）。"""
+    a = make_timeline_file(tmp_path, "run1", [event(9.0, 11.0, "数値の増加")])
+    b = make_timeline_file(
+        tmp_path, "run2", [event(9.2, 11.2, "数値の増加"), event(10.0, 12.0, "数値の増加")]
+    )
+    doc = union_timelines([a, b])
+    timeline = doc["timeline"]
+    # run2 の 2 件は互いに統合されず、run1 の 1 件がどちらかと統合されて 2 件になる
+    assert len(timeline) == 2
+    assert sorted(len(item["runs"]) for item in timeline) == [1, 2]
+
+
+# --- LLM 統合結果の照合（§4.6-2） --------------------------------------------------
+
+
+def machine_item(**overrides):
+    item = merge_module.normalize_event(
+        event(9.0, 11.0, "数値の増加", confidence="low", flags=["boundary"]), source="r1"
+    )
+    item.update(overrides)
+    return item
+
+
+def test_reconcile_fills_missing_fields_from_machine_result():
+    """LLM が書き落とした sources / flags / evidence を機械統合側から補う。"""
+    mechanical = [machine_item()]
+    llm = [
+        merge_module.normalize_event(
+            {
+                "start_sec": 9.0,
+                "end_sec": 11.0,
+                "title": "数値の増加",
+                "summary": "数値が増えた",
+                "importance": "high",
+                "confidence": "low",
+            }
+        )
+    ]
+    timeline, diff = reconcile_llm_timeline(mechanical, llm)
+    assert len(timeline) == 1
+    item = timeline[0]
+    assert item["sources"] == ["r1"]
+    assert item["flags"] == ["boundary"]
+    assert item["evidence"] == mechanical[0]["evidence"]
+    assert diff["dropped"] == [] and diff["added"] == []
+
+
+def test_reconcile_blocks_confidence_upgrade():
+    """LLM が confidence を上げていたら機械統合側の値に戻す（下げるのは許す）。"""
+    mechanical = [machine_item()]  # confidence=low
+    upgraded = merge_module.normalize_event(
+        event(9.0, 11.0, "数値の増加", confidence="high", visual=["F1 t=9.0s: 増加"])
+    )
+    timeline, _ = reconcile_llm_timeline(mechanical, [upgraded])
+    assert timeline[0]["confidence"] == "low"
+
+    downgraded = merge_module.normalize_event(
+        event(9.0, 11.0, "数値の増加", confidence="low", visual=["F1 t=9.0s: 増加"])
+    )
+    timeline, _ = reconcile_llm_timeline([machine_item(confidence="high")], [downgraded])
+    assert timeline[0]["confidence"] == "low"
+
+
+def test_reconcile_restores_dropped_items_with_flag():
+    """LLM が落とした項目は llm_dropped を付けて timeline に復元し、diff にも載せる。"""
+    mechanical = [
+        machine_item(),
+        merge_module.normalize_event(event(20.0, 21.0, "画面の暗転"), source="r2"),
+    ]
+    llm = [merge_module.normalize_event(event(9.0, 11.0, "数値の増加", confidence="low"))]
+    timeline, diff = reconcile_llm_timeline(mechanical, llm)
+    assert [item["title"] for item in timeline] == ["数値の増加", "画面の暗転"]
+    restored = timeline[1]
+    assert restored["flags"] == [LLM_DROPPED_FLAG]
+    assert restored["sources"] == ["r2"]
+    assert [item["title"] for item in diff["dropped"]] == ["画面の暗転"]
+
+
+def test_reconcile_flags_unmatched_llm_items():
+    """機械統合に対応の無い LLM 項目は消さず llm_unmatched を付けて残す。"""
+    mechanical = [machine_item()]
+    llm = [
+        merge_module.normalize_event(event(9.0, 11.0, "数値の増加", confidence="low")),
+        merge_module.normalize_event(event(40.0, 41.0, "入力に無かった項目")),
+    ]
+    timeline, diff = reconcile_llm_timeline(mechanical, llm)
+    assert len(timeline) == 2
+    invented = timeline[1]
+    assert invented["title"] == "入力に無かった項目"
+    assert invented["flags"] == [LLM_UNMATCHED_FLAG]
+    assert [item["title"] for item in diff["added"]] == ["入力に無かった項目"]
+
+
+def test_pair_items_is_one_to_one():
+    """1 つの LLM 項目に機械統合の 2 件が対応することはない（残りは dropped になる）。"""
+    mechanical = [
+        merge_module.normalize_event(event(9.0, 11.0, "数値の増加"), source="r1"),
+        merge_module.normalize_event(event(9.5, 11.5, "数値の増加"), source="r1"),
+    ]
+    llm = [merge_module.normalize_event(event(9.0, 11.5, "数値の増加"))]
+    pairs = pair_items(mechanical, llm)
+    assert pairs == {0: 0}
+
+    timeline, diff = reconcile_llm_timeline(mechanical, llm)
+    assert len(timeline) == 2
+    assert len(diff["dropped"]) == 1
+    assert sum(1 for item in timeline if LLM_DROPPED_FLAG in item["flags"]) == 1

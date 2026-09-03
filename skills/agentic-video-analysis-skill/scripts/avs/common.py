@@ -7,7 +7,8 @@
 - パス用の float 整形 (`format_float_for_path`)
 - ラベル用のタイムスタンプ整形 (`format_timestamp`)
 - フォント読み込み (`load_font`)
-- JSON 読み書き (`read_json` / `write_json`)
+- 入力テキストの読み込み (`read_text_utf8`。BOM 付き UTF-8 も読める)
+- JSON 読み書き (`read_json` / `write_json` / `write_json_atomic`)
 - APIキーの解決 (`resolve_api_key`)
 - ラベルのファイル名 slug 化 (`safe_slug`)
 """
@@ -247,8 +248,19 @@ def safe_slug(label: str, fallback: str) -> str:
     return text[:_SAFE_SLUG_MAX_LEN]
 
 
+def read_text_utf8(path: Path) -> str:
+    """入力テキストファイルを読む。
+
+    エンコーディングは `utf-8-sig`。Windows のエディタ（メモ帳、Excel 経由の書き出しなど）が
+    付ける BOM 付き UTF-8 でも先頭に `﻿` が残らない。BOM が無ければ通常の UTF-8 と同じ。
+    ユーザーが用意するファイル（JSON / プロンプト / objective / context / domain）はすべてこれで読む。
+    """
+    return Path(path).read_text(encoding="utf-8-sig")
+
+
 def read_json(path: Path) -> Any:
-    return json.loads(Path(path).read_text(encoding="utf-8"))
+    """JSON を読む（BOM 付き UTF-8 も可）。"""
+    return json.loads(read_text_utf8(path))
 
 
 def write_json(path: Path, data: Any) -> None:
@@ -256,3 +268,23 @@ def write_json(path: Path, data: Any) -> None:
         json.dumps(data, ensure_ascii=False, indent=2),
         encoding="utf-8",
     )
+
+
+def write_json_atomic(path: Path, data: Any) -> None:
+    """同じディレクトリの一時ファイルに書いてから `os.replace` で置き換える。
+
+    読み書きを繰り返す summary ファイル（`batch_summary.json` / `analysis_summary.json`）が、
+    書き込み途中で読まれて壊れた JSON に見えるのを防ぐ。
+
+    **プロセス間ロックはしない。** 同じ summary を複数プロセスから同時に更新すると、
+    最後に書いた方の内容で上書きされる（原子性はあるが排他はない）。
+    ドライバは単一プロセスで動かすこと。
+    """
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    tmp_path = target.with_name(f"{target.name}.{os.getpid()}.tmp")
+    tmp_path.write_text(
+        json.dumps(data, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    os.replace(tmp_path, target)

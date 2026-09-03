@@ -10,8 +10,8 @@
   audio_analysis.json        segments[]{start_sec,end_sec,kind,description,confidence}
   audio_analysis.raw.txt     モデルの生出力
   audio_analysis.prompt.txt  実際に送ったプロンプト
-  audio_analysis.meta.json   backend / model / メディア / usage / cost / latency / retries
-  <session>/usage.jsonl      上記 + name="audio_analysis" を1行追記
+  audio_analysis.meta.json   backend / model / step / メディア / usage / cost / latency / retries
+  <session>/usage.jsonl      上記 + name="audio_analysis" を1行追記（step="audio"）
 
 結果は `merge_analyses.py --audio <session>/audio/audio_analysis.json` で
 timeline に取り込める（映像側と重ならない項目には audio_unconfirmed が付く）。
@@ -21,24 +21,24 @@ from __future__ import annotations
 
 import argparse
 import dataclasses
-import json
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from avs.backends import BACKEND_NAMES, LLMRequest, MediaVideoClip, describe_media, get_backend
-from avs.common import configure_utf8_stdout, write_json
-from avs.cost import estimate_cost_usd
+from avs.common import configure_utf8_stdout, read_text_utf8, write_json
 from avs.merge import extract_json
 from avs.prompts import (
     AUDIO_SCHEMA,
     DEFAULT_OBJECTIVE,
     api_schema,
     assemble_prompt,
+    load_domain,
     resolve_text_arg,
+    step_for_prompt,
 )
+from avs.session import append_usage_line, build_call_meta
 
 DEFAULT_AUDIO_BACKEND = "gemini"
 OUTPUT_BASENAME = "audio_analysis"
@@ -60,6 +60,7 @@ class AudioOptions:
     model: str | None = None
     api_key: str | None = None
     objective: str | None = None
+    domain: str | None = None
     prompt: str | None = None
     output_dir: str | None = None
     strict_json: bool = False
@@ -78,15 +79,6 @@ def resolve_output_dir(options: AudioOptions) -> Path:
     if not options.session:
         raise RuntimeError("--session または --output-dir を指定してください")
     return Path(options.session).expanduser().resolve() / AUDIO_DIR_NAME
-
-
-def _append_usage(session: str | None, record: dict[str, Any]) -> None:
-    if not session:
-        return
-    session_dir = Path(session).expanduser().resolve()
-    session_dir.mkdir(parents=True, exist_ok=True)
-    with (session_dir / "usage.jsonl").open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
 def run_audio_analysis(options: AudioOptions) -> int:
@@ -120,13 +112,15 @@ def run_audio_analysis(options: AudioOptions) -> int:
     if not prompt_path.exists():
         raise RuntimeError(f"プロンプトファイルが見つかりません: {prompt_path}")
     objective = resolve_text_arg(options.objective) or DEFAULT_OBJECTIVE
+    domain = load_domain(options.domain) if options.domain else None
 
     prompt = assemble_prompt(
-        prompt_path.read_text(encoding="utf-8"),
+        read_text_utf8(prompt_path),
         objective,
         tile_context="",
         context_text=None,
         note=None,
+        domain=domain,
         schema=AUDIO_SCHEMA,
     )
     # 範囲を絞らず全編を送る（end_sec=None / fps=None = クリッピングもサンプリングもしない）
@@ -168,23 +162,16 @@ def run_audio_analysis(options: AudioOptions) -> int:
             continue
         break
 
-    last = responses[-1]
-    usage = last.usage
-    cost_usd, is_estimate = estimate_cost_usd(last.model, usage)
-    meta = {
-        "backend": last.backend,
-        "model": last.model,
-        "media": describe_media(media),
-        "usage": usage,
-        "cost_usd": cost_usd,
-        "cost_is_estimate": is_estimate,
-        "latency_sec": round(sum(item.latency_sec for item in responses), 3),
-        "retries": sum(getattr(item, "retries", 0) for item in responses) + json_retries,
-        "prompt_chars": len(prompt),
-        "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-    }
+    # usage はリトライ分も含めて合算する（合算しないと集計からトークンが抜ける）
+    meta = build_call_meta(
+        responses,
+        describe_media(media),
+        prompt_chars=len(prompt),
+        json_retries=json_retries,
+        step=step_for_prompt(prompt_path),
+    )
     write_json(base.with_name(f"{base.name}.meta.json"), meta)
-    _append_usage(options.session, {"name": OUTPUT_BASENAME, **meta})
+    append_usage_line(options.session, {"name": OUTPUT_BASENAME, **meta})
 
     if parsed is None:
         raise RuntimeError(
@@ -235,6 +222,11 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
         "--objective",
         default=None,
         help=f"解析の目的（テキスト or ファイルパス）。既定: {DEFAULT_OBJECTIVE}",
+    )
+    parser.add_argument(
+        "--domain",
+        default=None,
+        help="ドメイン定義 JSON（domain.json）。用語・watchlist などの手引きをプロンプトに足す",
     )
     parser.add_argument(
         "--prompt",

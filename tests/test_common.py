@@ -1,10 +1,19 @@
-"""avs.common のテスト（APIキー解決）。"""
+"""avs.common のテスト（APIキー解決 / slug / BOM 付き UTF-8 / 原子的な JSON 書き込み）。"""
 
 from __future__ import annotations
 
+import json
+
 import pytest
 
-from avs.common import BACKEND_ENV_NAMES, resolve_api_key, safe_slug
+from avs.common import (
+    BACKEND_ENV_NAMES,
+    read_json,
+    read_text_utf8,
+    resolve_api_key,
+    safe_slug,
+    write_json_atomic,
+)
 
 
 @pytest.fixture(autouse=True)
@@ -127,3 +136,44 @@ def test_safe_slug_truncates_to_80_chars():
     slug = safe_slug(long_label, "fallback")
     assert len(slug) == 80
     assert slug == "a" * 80
+
+
+# --- BOM 付き UTF-8（Windows のエディタが付ける） ----------------------------------
+
+
+def test_read_json_accepts_utf8_bom(tmp_path):
+    path = tmp_path / "domain.json"
+    path.write_text(json.dumps({"name": "テスト"}, ensure_ascii=False), encoding="utf-8-sig")
+    assert path.read_bytes().startswith(b"\xef\xbb\xbf")  # BOM が付いている
+    assert read_json(path) == {"name": "テスト"}
+
+
+def test_read_json_still_accepts_plain_utf8(tmp_path):
+    path = tmp_path / "plain.json"
+    path.write_text('{"name": "テスト"}', encoding="utf-8")
+    assert read_json(path) == {"name": "テスト"}
+
+
+def test_read_text_utf8_strips_bom(tmp_path):
+    path = tmp_path / "prompt.txt"
+    path.write_text("# 見出し\n本文", encoding="utf-8-sig")
+    text = read_text_utf8(path)
+    assert text.startswith("# 見出し")
+    assert "\ufeff" not in text
+
+
+# --- 原子的な JSON 書き込み ---------------------------------------------------------
+
+
+def test_write_json_atomic_writes_and_leaves_no_temp_file(tmp_path):
+    path = tmp_path / "nested" / "summary.json"
+    write_json_atomic(path, {"results": [1, 2, 3]})
+    assert read_json(path) == {"results": [1, 2, 3]}
+    assert [item.name for item in path.parent.iterdir()] == ["summary.json"]
+
+
+def test_write_json_atomic_replaces_existing_file(tmp_path):
+    path = tmp_path / "summary.json"
+    write_json_atomic(path, {"n": 1})
+    write_json_atomic(path, {"n": 2})
+    assert read_json(path) == {"n": 2}

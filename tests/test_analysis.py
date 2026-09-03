@@ -1018,3 +1018,155 @@ def test_run_analysis_real_prompt_schema_placeholder_is_fully_substituted(tmp_pa
     assert run_analysis(options) == 0
 
     assert "{{" not in backend.requests[0].prompt
+
+
+# --- usage.jsonl の step（§4.7。detail が other に落ちないこと） ---------------------
+
+
+def test_usage_records_step_from_prompt_name(tmp_path, monkeypatch):
+    """step はプロンプト名（stem）から決まる。出力名からの推測ではない。"""
+    manifest_path = make_manifest(tmp_path)
+    session = tmp_path / "session"
+    prompt = tmp_path / "detail.txt"
+    prompt.write_text("本文", encoding="utf-8")
+    backend = FakeBackend()
+    monkeypatch.setattr("avs.analysis.build_backend", lambda options: backend)
+
+    options = default_options(
+        manifest=[str(manifest_path)],
+        prompt=str(prompt),
+        session=str(session),
+        output_dir=str(tmp_path / "out"),
+    )
+    assert run_analysis(options) == 0
+
+    record = json.loads((session / "usage.jsonl").read_text(encoding="utf-8").strip())
+    # 出力名は cand_a_analysis なので、名前からのキーワード判定では other に落ちる
+    assert record["name"] == "cand_a_analysis"
+    assert record["step"] == "detail"
+    meta = json.loads((tmp_path / "out" / "cand_a_analysis.meta.json").read_text(encoding="utf-8"))
+    assert meta["step"] == "detail"
+
+
+def test_usage_step_is_other_for_unknown_prompt_name(tmp_path, monkeypatch):
+    manifest_path = make_manifest(tmp_path)
+    session = tmp_path / "session"
+    prompt = tmp_path / "my_custom_prompt.txt"
+    prompt.write_text("本文", encoding="utf-8")
+    monkeypatch.setattr("avs.analysis.build_backend", lambda options: FakeBackend())
+
+    options = default_options(
+        manifest=[str(manifest_path)],
+        prompt=str(prompt),
+        session=str(session),
+        output_dir=str(tmp_path / "out"),
+    )
+    assert run_analysis(options) == 0
+    record = json.loads((session / "usage.jsonl").read_text(encoding="utf-8").strip())
+    assert record["step"] == "other"
+
+
+# --- --raw のときの summary の output（§4.5） --------------------------------------
+
+
+def test_analysis_summary_output_points_to_txt_in_raw_mode(tmp_path, monkeypatch):
+    config_path, _video = make_ranges_config(tmp_path)
+    prompt = tmp_path / "detail.txt"
+    prompt.write_text("本文", encoding="utf-8")
+    monkeypatch.setattr(
+        "avs.analysis.build_backend", lambda options: FakeBackend(supports_video_clip=True)
+    )
+
+    options = default_options(ranges=str(config_path), prompt=str(prompt), expect_json=False)
+    assert run_analysis(options) == 0
+
+    summary = json.loads((tmp_path / "out" / "analysis_summary.json").read_text(encoding="utf-8"))
+    outputs = {entry["label"]: entry["output"] for entry in summary["results"]}
+    assert all(value.endswith(".txt") for value in outputs.values()), outputs
+    assert (tmp_path / "out" / "cand_a_analysis.txt").exists()
+
+
+def test_analysis_summary_output_points_to_json_by_default(tmp_path, monkeypatch):
+    config_path, _video = make_ranges_config(tmp_path)
+    prompt = tmp_path / "detail.txt"
+    prompt.write_text("本文", encoding="utf-8")
+    monkeypatch.setattr(
+        "avs.analysis.build_backend", lambda options: FakeBackend(supports_video_clip=True)
+    )
+
+    assert run_analysis(default_options(ranges=str(config_path), prompt=str(prompt))) == 0
+    summary = json.loads((tmp_path / "out" / "analysis_summary.json").read_text(encoding="utf-8"))
+    assert all(entry["output"].endswith(".json") for entry in summary["results"])
+
+
+def test_batch_summary_write_back_records_analysis_output(tmp_path, monkeypatch):
+    manifest_path = make_manifest(tmp_path)
+    summary_path = tmp_path / "batch_summary.json"
+    summary_path.write_text(
+        json.dumps(
+            {
+                "results": [
+                    {
+                        "manifest_path": str(manifest_path),
+                        "label": "cand_a",
+                        "output": str(tmp_path / "cand_a" / "tile.jpg"),
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+    prompt = tmp_path / "detail.txt"
+    prompt.write_text("本文", encoding="utf-8")
+    monkeypatch.setattr("avs.analysis.build_backend", lambda options: FakeBackend())
+
+    options = default_options(
+        summary=str(summary_path),
+        prompt=str(prompt),
+        output_dir=str(tmp_path / "out"),
+        expect_json=False,
+    )
+    assert run_analysis(options) == 0
+
+    entry = json.loads(summary_path.read_text(encoding="utf-8"))["results"][0]
+    assert entry["analysis_status"] == "ok"
+    assert entry["analysis_output"].endswith("cand_a_analysis.txt")
+    # タイル画像を指す output は上書きしない
+    assert entry["output"].endswith("tile.jpg")
+
+
+# --- BOM 付き UTF-8 の入力（§4.7） --------------------------------------------------
+
+
+def test_run_analysis_reads_prompt_and_context_with_bom(tmp_path, monkeypatch):
+    manifest_path = make_manifest(tmp_path)
+    prompt = tmp_path / "detail.txt"
+    prompt.write_text("本文プロンプト\n目的: {{OBJECTIVE}}", encoding="utf-8-sig")
+    objective = tmp_path / "objective.txt"
+    objective.write_text("BOM 付きの目的", encoding="utf-8-sig")
+    context = tmp_path / "context.md"
+    context.write_text("BOM 付きの追加情報", encoding="utf-8-sig")
+    domain_path = tmp_path / "domain.json"
+    domain_path.write_text(
+        json.dumps({"name": "テストドメイン", "watchlist": ["数値の増減"]}, ensure_ascii=False),
+        encoding="utf-8-sig",
+    )
+    backend = FakeBackend()
+    monkeypatch.setattr("avs.analysis.build_backend", lambda options: backend)
+
+    options = default_options(
+        manifest=[str(manifest_path)],
+        prompt=str(prompt),
+        objective=str(objective),
+        context=str(context),
+        domain=str(domain_path),
+        output_dir=str(tmp_path / "out"),
+    )
+    assert run_analysis(options) == 0
+
+    sent = backend.requests[0].prompt
+    assert "\ufeff" not in sent
+    assert sent.startswith("本文プロンプト")
+    assert "BOM 付きの目的" in sent
+    assert "BOM 付きの追加情報" in sent
+    assert "数値の増減" in sent

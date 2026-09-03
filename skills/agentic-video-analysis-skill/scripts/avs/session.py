@@ -2,6 +2,8 @@
 """セッションディレクトリの管理（session.json / usage.jsonl）とレポート集計。
 
 - `Session`: セッションディレクトリの作成・探索・ステップ記録
+- `build_call_meta` / `append_usage_line`: LLM 呼び出し 1 回分の監査記録（`meta.json` と
+  `usage.jsonl` の 1 行）を作る。analysis / merge / audio はすべてこれを通す（§4.7）
 - `load_usage_records` / `summarize_usage`: `usage.jsonl` の集計（呼び出し回数・トークン・USD・latency）
 - `scan_next_actions`: セッション内の `*_analysis.json` / `*_validated.json` /
   `batch_summary.json` / `analysis_summary.json` を走査し、次アクション候補を挙げる
@@ -16,13 +18,14 @@ from __future__ import annotations
 
 import json
 import statistics
+import threading
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from avs.common import probe_duration_sec, read_json, write_json
-from avs.cost import lookup_pricing
+from avs.cost import estimate_cost_usd, lookup_pricing, sum_usage
 
 SESSION_FILENAME = "session.json"
 USAGE_FILENAME = "usage.jsonl"
@@ -33,8 +36,11 @@ DEFAULT_TOKENS_PER_TILE_ESTIMATE = 1000
 FALLBACK_BLENDED_PRICE_PER_M = 2.25
 
 # usage.jsonl の name（例: "cand_a_analysis", "overview_full_analysis"）を
-# 大まかなステップに分類するためのキーワード（見つからなければ "other"）
+# 大まかなステップに分類するためのキーワード（見つからなければ "other"）。
+# `step` を書いていない古い usage.jsonl のためのフォールバック。
 STEP_KEYWORDS = ("overview", "chapters", "detail", "zoom", "refine", "audio", "merge")
+
+_usage_lock = threading.Lock()
 
 
 # --- セッション ------------------------------------------------------------------
@@ -121,6 +127,58 @@ class Session:
         write_json(self.session_path, data)
 
 
+# --- 監査記録（meta.json / usage.jsonl の 1 行） -------------------------------------
+
+
+def build_call_meta(
+    responses: list[Any],
+    media_desc: list[str],
+    prompt_chars: int,
+    json_retries: int = 0,
+    step: str = "other",
+) -> dict[str, Any]:
+    """LLM 呼び出し 1 回分（JSON リトライ分を含む）の監査メタを作る。
+
+    `responses` は同じ呼び出しの試行（本番 + リトライ）を時系列で渡す。
+    usage は `sum_usage` で合算し、latency と retries も全試行の合計にする
+    （リトライ分のトークンが集計から抜けるのを防ぐ）。
+
+    キーは analysis / merge / audio の `*.meta.json` で共通。
+    `step` は `avs.prompts.step_for_prompt` が決めるステップ名で、
+    `usage.jsonl` の集計（`summarize_usage`）が名前の推測をせずに済むようにする。
+    """
+    usage = sum_usage([response.usage for response in responses])
+    model = responses[-1].model
+    cost_usd, is_estimate = estimate_cost_usd(model, usage)
+    return {
+        "backend": responses[-1].backend,
+        "model": model,
+        "step": step,
+        "media": list(media_desc),
+        "usage": usage,
+        "cost_usd": cost_usd,
+        "cost_is_estimate": is_estimate,
+        "latency_sec": round(sum(response.latency_sec for response in responses), 3),
+        "retries": sum(getattr(response, "retries", 0) or 0 for response in responses) + json_retries,
+        "prompt_chars": prompt_chars,
+        "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+
+
+def append_usage_line(session: str | Path | None, record: dict[str, Any]) -> None:
+    """`<session>/usage.jsonl` に 1 行追記する（`session` が None なら何もしない）。
+
+    並列実行から呼ばれるのでロックで囲む（同一プロセス内のみ）。
+    """
+    if not session:
+        return
+    session_dir = Path(session).expanduser()
+    session_dir.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(record, ensure_ascii=False) + "\n"
+    with _usage_lock, (session_dir / USAGE_FILENAME).open("a", encoding="utf-8") as handle:
+        handle.write(line)
+
+
 # --- usage.jsonl 集計 -------------------------------------------------------------
 
 
@@ -141,11 +199,24 @@ def load_usage_records(session_dir: Path) -> list[dict[str, Any]]:
 
 
 def classify_step(name: str) -> str:
+    """出力名からステップを推測する（`step` を持たない古い usage.jsonl 用のフォールバック）。"""
     lowered = name.lower()
     for keyword in STEP_KEYWORDS:
         if keyword in lowered:
             return keyword
     return "other"
+
+
+def step_of(record: dict[str, Any]) -> str:
+    """usage.jsonl の 1 行のステップ名。`step` があればそれを使う。
+
+    `step` は呼び出し元がプロンプト名から決めた正確な値
+    （`cand_00_analysis` のような出力名からのキーワード推測では detail が other に落ちる）。
+    """
+    step = record.get("step")
+    if isinstance(step, str) and step:
+        return step
+    return classify_step(str(record.get("name") or ""))
 
 
 def summarize_usage(records: list[dict[str, Any]]) -> dict[str, Any]:
@@ -172,7 +243,7 @@ def summarize_usage(records: list[dict[str, Any]]) -> dict[str, Any]:
         else:
             actual_cost += float(cost)
 
-        step = classify_step(str(record.get("name") or ""))
+        step = step_of(record)
         bucket = by_step.setdefault(step, {"calls": 0, "total_tokens": 0, "cost_usd": 0.0})
         bucket["calls"] += 1
         bucket["total_tokens"] += int(usage.get("total_tokens") or 0)

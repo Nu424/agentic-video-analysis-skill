@@ -31,6 +31,8 @@ import re
 from pathlib import Path
 from typing import Any
 
+from avs.common import read_text_utf8
+
 DEFAULT_OBJECTIVE = "動画の見どころ候補の抽出"
 OBJECTIVE_PLACEHOLDER = "{{OBJECTIVE}}"
 SCHEMA_PLACEHOLDER = "{{SCHEMA}}"
@@ -49,7 +51,7 @@ def resolve_text_arg(value: str | None) -> str | None:
     candidate = Path(value).expanduser()
     try:
         if candidate.exists() and candidate.is_file():
-            return candidate.read_text(encoding="utf-8").strip()
+            return read_text_utf8(candidate).strip()
     except OSError:
         pass
     return value
@@ -253,7 +255,19 @@ MERGE_SCHEMA: dict[str, Any] = {
                     "sources": _string_array(["candidate_a"], "統合元の範囲ラベル"),
                     "flags": _string_array(["boundary"], "入力から引き継ぐ"),
                 },
-                "required": ["start_sec", "end_sec", "title", "summary", "importance"],
+                # 統合結果は機械統合と照合するため、照合に使うキーも必須にする
+                # （欠けたものは `reconcile_llm_timeline` が機械側から補う）
+                "required": [
+                    "start_sec",
+                    "end_sec",
+                    "title",
+                    "summary",
+                    "importance",
+                    "confidence",
+                    "evidence",
+                    "sources",
+                    "flags",
+                ],
             },
         },
     },
@@ -314,6 +328,21 @@ SCHEMAS: dict[str, dict[str, Any]] = {
     "audio": AUDIO_SCHEMA,
     "chapters": CHAPTERS_SCHEMA,
 }
+
+
+# usage.jsonl / meta.json に書くステップ名。`SCHEMAS` と同じ stem 規則で決める
+STEP_NAMES: tuple[str, ...] = tuple(SCHEMAS)
+OTHER_STEP = "other"
+
+
+def step_for_prompt(prompt_path: str | Path) -> str:
+    """プロンプトファイル名（stem）からステップ名を決める。未知の stem は `"other"`。
+
+    `schema_for_prompt` と同じ stem 規則を使うので、`detail.txt` は必ず `detail` になる
+    （出力ファイル名からキーワードで推測すると `cand_00_analysis` が `other` に落ちる）。
+    """
+    stem = Path(prompt_path).stem
+    return stem if stem in STEP_NAMES else OTHER_STEP
 
 
 def schema_for_prompt(prompt_path: str | Path) -> dict[str, Any] | None:
@@ -429,7 +458,7 @@ def load_domain(path: str | Path) -> dict[str, Any]:
     if not domain_path.exists():
         raise DomainError(f"ドメイン定義ファイルが見つかりません: {domain_path}")
     try:
-        raw = domain_path.read_text(encoding="utf-8")
+        raw = read_text_utf8(domain_path)
     except OSError as exc:
         raise DomainError(f"ドメイン定義ファイルを読めません: {domain_path}: {exc}") from exc
     try:

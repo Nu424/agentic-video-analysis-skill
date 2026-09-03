@@ -11,6 +11,7 @@ import re
 import pytest
 
 from avs.ranges import (
+    _verify_full_coverage,
     make_range_options,
     merge_defaults,
     merge_range_entries,
@@ -529,3 +530,155 @@ def test_plan_full_coverage_rejects_invalid_coverage():
 def test_plan_full_coverage_requires_start_end_keys():
     with pytest.raises(RuntimeError):
         plan_full_coverage([{"title": "no times"}], 10.0)
+
+
+# --- 全区間カバーの連続性（§4.3-3,4） ---------------------------------------------
+
+
+def assert_contiguous(ranges, duration_sec: float) -> None:
+    """先頭 0 / 末尾 duration / 範囲同士が隙間なく接していることを確かめる。"""
+    assert ranges, "範囲が空です"
+    assert ranges[0]["start"] == 0.0
+    assert ranges[-1]["end"] == pytest.approx(duration_sec)
+    for left, right in zip(ranges, ranges[1:]):
+        assert left["end"] == pytest.approx(right["start"]), (left, right)
+
+
+def test_plan_full_coverage_absorbs_sub_min_gap_between_candidates():
+    """1 秒未満（= min_gap_sec 未満）の内部隙間は、直前の範囲を伸ばして吸収する。"""
+    plan = plan_full_coverage(
+        [{"start_sec": 2.0, "end_sec": 5.0}, {"start_sec": 5.5, "end_sec": 9.0}],
+        12.0,
+        min_gap_sec=1.0,
+    )
+    ranges = plan["ranges"]
+    assert_contiguous(ranges, 12.0)
+    # 0.5 秒の隙間に gap 範囲は作らず、直前の候補が 5.5 まで伸びている
+    assert [r["label"] for r in ranges] == ["gap_00", "cand_00", "cand_01", "gap_01"]
+    assert (ranges[1]["start"], ranges[1]["end"]) == (2.0, 5.5)
+
+
+def test_plan_full_coverage_absorbs_sub_min_gap_at_head_and_tail():
+    """先頭・末尾の短い隙間も、隣の範囲を伸ばして埋める（独立した gap は作らない）。"""
+    plan = plan_full_coverage(
+        [{"start_sec": 0.4, "end_sec": 5.0}], 5.4, min_gap_sec=1.0, min_range_sec=2.0
+    )
+    ranges = plan["ranges"]
+    assert len(ranges) == 1
+    assert (ranges[0]["start"], ranges[0]["end"]) == (0.0, 5.4)
+    assert_contiguous(ranges, 5.4)
+
+
+def test_plan_full_coverage_gap_threshold_is_inclusive():
+    """隙間がちょうど min_gap_sec なら gap 範囲、わずかに下回れば吸収（境界値）。"""
+    exact = plan_full_coverage(
+        [{"start_sec": 2.0, "end_sec": 5.0}, {"start_sec": 6.0, "end_sec": 9.0}],
+        9.0,
+        min_gap_sec=1.0,
+    )["ranges"]
+    assert [r["label"] for r in exact] == ["gap_00", "cand_00", "gap_01", "cand_01"]
+    assert (exact[2]["start"], exact[2]["end"]) == (5.0, 6.0)
+    assert_contiguous(exact, 9.0)
+
+    just_under = plan_full_coverage(
+        [{"start_sec": 2.0, "end_sec": 5.0}, {"start_sec": 5.99, "end_sec": 9.0}],
+        9.0,
+        min_gap_sec=1.0,
+    )["ranges"]
+    assert [r["label"] for r in just_under] == ["gap_00", "cand_00", "cand_01"]
+    assert just_under[1]["end"] == 5.99
+    assert_contiguous(just_under, 9.0)
+
+
+def test_plan_full_coverage_short_merge_does_not_exceed_max_range():
+    """短い範囲のマージで max_range_sec を超えるなら、マージせず短いまま残す。"""
+    plan = plan_full_coverage(
+        [{"start_sec": 0.0, "end_sec": 7.5}, {"start_sec": 7.5, "end_sec": 8.5}],
+        8.5,
+        max_range_sec=8.0,
+        min_range_sec=2.0,
+    )
+    ranges = plan["ranges"]
+    assert len(ranges) == 2
+    assert (ranges[0]["start"], ranges[0]["end"]) == (0.0, 7.5)
+    assert (ranges[1]["start"], ranges[1]["end"]) == (7.5, 8.5)  # 1.0 秒のまま残る
+    for entry in ranges:
+        assert entry["end"] - entry["start"] <= 8.0 + 1e-9
+    assert_contiguous(ranges, 8.5)
+
+
+def test_plan_full_coverage_absorbed_gap_is_resplit_under_max_range():
+    """隙間の吸収で長くなった範囲は、max_range_sec 以下に再分割される。"""
+    plan = plan_full_coverage(
+        [{"start_sec": 0.0, "end_sec": 5.0}], 12.0, max_range_sec=8.0, min_gap_sec=100.0
+    )
+    ranges = plan["ranges"]
+    assert len(ranges) == 2  # 0-12 を吸収したあと 2 片に等分割
+    for entry in ranges:
+        assert entry["end"] - entry["start"] <= 8.0 + 1e-9
+    assert_contiguous(ranges, 12.0)
+
+
+def test_plan_full_coverage_resolves_partial_overlap_without_gaps():
+    """overlap_threshold 未満で残った重なりも、境界を詰めて連続させる。"""
+    plan = plan_full_coverage(
+        [{"start_sec": 0.0, "end_sec": 6.0}, {"start_sec": 5.0, "end_sec": 10.0}],
+        10.0,
+        overlap_threshold=0.9,
+        max_range_sec=8.0,
+    )
+    assert_contiguous(plan["ranges"], 10.0)
+
+
+def test_plan_full_coverage_is_contiguous_for_various_inputs():
+    cases = [
+        ([], 3.0),
+        ([{"start_sec": 0.0, "end_sec": 53.6}], 53.6),
+        ([{"start_sec": 0.2, "end_sec": 0.4}], 1.0),
+        (
+            [
+                {"start_sec": 1.0, "end_sec": 1.2},
+                {"start_sec": 1.3, "end_sec": 4.0},
+                {"start_sec": 30.0, "end_sec": 44.0},
+                {"start_sec": 52.0, "end_sec": 60.0},
+            ],
+            53.6,
+        ),
+    ]
+    for candidates, duration in cases:
+        plan = plan_full_coverage(candidates, duration)
+        assert_contiguous(plan["ranges"], round(duration, 2))
+
+
+def test_plan_full_coverage_high_only_does_not_require_contiguity():
+    """high-only で low 範囲を落としたときは連続性を要求しない（残りは飛び飛びで良い）。"""
+    plan = plan_full_coverage(
+        [{"start_sec": 10.0, "end_sec": 12.0, "priority": "high"}],
+        20.0,
+        coverage="high-only",
+    )
+    assert plan["plan"]["dropped"]
+    assert plan["ranges"][0]["start"] != 0.0
+
+
+def test_verify_full_coverage_rejects_broken_plans():
+    ok = [
+        {"label": "a", "start": 0.0, "end": 5.0},
+        {"label": "b", "start": 5.0, "end": 10.0},
+    ]
+    _verify_full_coverage(ok, 10.0)  # 例外が出ない
+
+    with pytest.raises(RuntimeError):
+        _verify_full_coverage([], 10.0)
+    with pytest.raises(RuntimeError, match="先頭"):
+        _verify_full_coverage([{"label": "a", "start": 1.0, "end": 10.0}], 10.0)
+    with pytest.raises(RuntimeError, match="末尾"):
+        _verify_full_coverage([{"label": "a", "start": 0.0, "end": 9.0}], 10.0)
+    with pytest.raises(RuntimeError, match="連続"):
+        _verify_full_coverage(
+            [
+                {"label": "a", "start": 0.0, "end": 4.0},
+                {"label": "b", "start": 5.0, "end": 10.0},
+            ],
+            10.0,
+        )

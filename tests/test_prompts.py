@@ -293,24 +293,57 @@ FORBIDDEN_TERMS = [
     "レース", "サーキット", "コース", "ラップ", "ドリフト", "順位", "コイン",
     "アイテム枠", "ゴール", "スタートダッシュ", "サッカー", "野球", "バスケ",
     "ゴールキーパー", "ホームラン", "スポーツ",
-    # ジャンルの決め打ち
-    "ゲーム実況", "ゲーム画面", "プレイヤーキャラ",
+    # ジャンルの決め打ち（「ゲーム」「プレイ映像」「HUD」を含む語も丸ごと弾く）
+    "ゲーム", "プレイ映像", "プレイヤーキャラ", "HUD",
 ]
 
 
-def _guarded_files() -> list[Path]:
-    return sorted(PROMPTS_DIR.glob("*.txt")) + [DOMAIN_EXAMPLE]
+def _iter_domain_strings(node, depth: int = 0) -> list[str]:
+    """ドメイン定義から、検査対象の文字列を集める。
+
+    トップレベルのキー名（`hud_notes` / `watchlist` など）は**仕様で決まった名前**なので
+    検査しない。値と、入れ子のキー名（`vocabulary` の用語など＝利用者が書く内容）は検査する。
+    """
+    if isinstance(node, str):
+        return [node]
+    if isinstance(node, dict):
+        found: list[str] = []
+        for key, value in node.items():
+            if depth > 0:
+                found.append(str(key))
+            found.extend(_iter_domain_strings(value, depth + 1))
+        return found
+    if isinstance(node, list):
+        found = []
+        for item in node:
+            found.extend(_iter_domain_strings(item, depth + 1))
+        return found
+    return []
+
+
+def _guarded_texts() -> list[tuple[str, str]]:
+    """(表示名, 検査対象テキスト) の一覧。"""
+    texts = [(path.name, path.read_text(encoding="utf-8")) for path in sorted(PROMPTS_DIR.glob("*.txt"))]
+    domain = json.loads(DOMAIN_EXAMPLE.read_text(encoding="utf-8"))
+    texts.append((DOMAIN_EXAMPLE.name, "\n".join(_iter_domain_strings(domain))))
+    return texts
 
 
 def test_no_domain_specific_proper_nouns():
     hits: list[str] = []
-    for path in _guarded_files():
-        text = path.read_text(encoding="utf-8")
+    for name, text in _guarded_texts():
         lowered = text.lower()
         for term in FORBIDDEN_TERMS:
             if term.lower() in lowered:
-                hits.append(f"{path.name}: {term}")
+                hits.append(f"{name}: {term}")
     assert not hits, f"固有名詞・ドメイン固有語が混入しています: {hits}"
+
+
+def test_domain_example_keeps_spec_key_names():
+    """`hud_notes` はスキーマのキー名なので、禁止語の検査対象から外れている。"""
+    domain = json.loads(DOMAIN_EXAMPLE.read_text(encoding="utf-8"))
+    assert "hud_notes" in domain
+    assert "hud" not in "\n".join(_iter_domain_strings(domain)).lower()
 
 
 def test_no_domain_specific_proper_nouns_in_schema_examples():
@@ -318,3 +351,19 @@ def test_no_domain_specific_proper_nouns_in_schema_examples():
         rendered = render_schema_example(SCHEMAS[name]).lower()
         for term in FORBIDDEN_TERMS:
             assert term.lower() not in rendered, f"{name} スキーマの例に {term} が入っています"
+
+
+def test_merge_schema_requires_audit_fields():
+    """統合結果は機械統合と照合するので、照合と監査に使うキーを必須にする（§4.6-2）。"""
+    item_schema = SCHEMAS["merge"]["properties"]["timeline"]["items"]
+    assert set(item_schema["required"]) == {
+        "start_sec",
+        "end_sec",
+        "title",
+        "summary",
+        "importance",
+        "confidence",
+        "evidence",
+        "sources",
+        "flags",
+    }

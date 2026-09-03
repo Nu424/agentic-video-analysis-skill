@@ -13,10 +13,12 @@ import pytest
 from avs.session import (
     Session,
     build_report,
+    build_call_meta,
     classify_step,
     estimate_cost,
     load_usage_records,
     scan_next_actions,
+    step_of,
     summarize_usage,
 )
 
@@ -275,3 +277,70 @@ def test_build_report_with_estimate(tmp_path):
 def test_build_report_raises_for_missing_session_dir(tmp_path):
     with pytest.raises(RuntimeError):
         build_report(tmp_path / "missing", do_estimate=False)
+
+
+# --- step の優先（§4.7。detail が other に落ちない） ---------------------------------
+
+
+def test_step_of_prefers_explicit_step():
+    assert step_of({"name": "cand_00_analysis", "step": "detail"}) == "detail"
+    assert step_of({"name": "cand_00_analysis", "step": "zoom"}) == "zoom"
+
+
+def test_step_of_falls_back_to_name_keywords():
+    """`step` を持たない古い usage.jsonl は従来どおり名前から推測する。"""
+    assert step_of({"name": "overview_full_analysis"}) == "overview"
+    assert step_of({"name": "cand_00_analysis"}) == "other"
+    assert step_of({"name": "cand_00_analysis", "step": ""}) == "other"
+
+
+def test_summarize_usage_groups_by_explicit_step():
+    records = [
+        _usage_record(name="cand_00_analysis", cost_usd=0.001, cost_is_estimate=False),
+        _usage_record(name="cand_01_analysis", cost_usd=0.001, cost_is_estimate=False),
+    ]
+    # step が無ければ名前から推測して other に落ちる
+    assert set(summarize_usage(records)["by_step"]) == {"other"}
+
+    for record in records:
+        record["step"] = "detail"
+    summary = summarize_usage(records)
+    assert set(summary["by_step"]) == {"detail"}
+    assert summary["by_step"]["detail"]["calls"] == 2
+
+
+# --- build_call_meta（監査記録の共通形） --------------------------------------------
+
+
+class _Response:
+    def __init__(self, total_tokens: int, latency_sec: float, retries: int = 0):
+        self.usage = {
+            "input_tokens": total_tokens // 2,
+            "output_tokens": total_tokens // 2,
+            "reasoning_tokens": 0,
+            "total_tokens": total_tokens,
+            "cost_usd": 0.001,
+            "raw": {},
+        }
+        self.latency_sec = latency_sec
+        self.retries = retries
+        self.model = "fake-model"
+        self.backend = "fake"
+
+
+def test_build_call_meta_sums_usage_latency_and_retries():
+    meta = build_call_meta(
+        [_Response(100, 1.0, retries=1), _Response(200, 0.5)],
+        media_desc=["tile_000.jpg"],
+        prompt_chars=42,
+        json_retries=1,
+        step="audio",
+    )
+    assert meta["usage"]["total_tokens"] == 300  # リトライ分も合算する
+    assert meta["latency_sec"] == 1.5
+    assert meta["retries"] == 2  # 通信リトライ 1 + JSON リトライ 1
+    assert meta["step"] == "audio"
+    assert meta["media"] == ["tile_000.jpg"]
+    assert meta["prompt_chars"] == 42
+    assert meta["backend"] == "fake" and meta["model"] == "fake-model"
+    assert meta["created_at"]

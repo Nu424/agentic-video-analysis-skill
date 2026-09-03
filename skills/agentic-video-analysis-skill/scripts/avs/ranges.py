@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import math
 import re
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 
@@ -321,6 +322,9 @@ _PRIORITY_RANK = {"high": 3, "medium": 2, "low": 1}
 _SLUG_RE = re.compile(r"[^a-zA-Z0-9]+")
 _COVERAGE_MODES = ("full", "priority", "high-only")
 
+# 秒の比較に使う許容誤差（浮動小数の丸め対策）
+_EPS = 1e-9
+
 
 def resolve_coverage(
     coverage: str,
@@ -412,91 +416,136 @@ def _split_long_items(items: list[dict[str, Any]], max_range_sec: float) -> list
     return result
 
 
+def _absorb(target: dict[str, Any], other: dict[str, Any]) -> None:
+    """`other` の priority / reasons / titles を `target` に取り込む（時間は呼び出し側が決める）。"""
+    target["priority"] = _max_priority(target["priority"], other["priority"])
+    target["reasons"] = _merge_text_lists(target["reasons"], other["reasons"])
+    target["titles"] = _merge_text_lists(target["titles"], other["titles"])
+    if other.get("source") == "overview":
+        target["source"] = "overview"
+
+
 def _merge_short_items(
-    items: list[dict[str, Any]], min_range_sec: float, min_gap_sec: float
+    items: list[dict[str, Any]],
+    min_range_sec: float,
+    min_gap_sec: float,
+    max_range_sec: float,
 ) -> list[dict[str, Any]]:
     """`min_range_sec` 未満の範囲を、隙間が `min_gap_sec` 未満の隣接範囲にだけマージする。
 
     隙間が `min_gap_sec` 以上離れた候補同士は無関係な出来事の可能性が高いので混ぜない
     （その隙間は後段の `_fill_gaps` が gap 範囲として埋める）。隣接範囲が無ければ
     短いまま残す。
+
+    マージ後の長さが `max_range_sec` を超えるときはマージしない（1 回の呼び出しに詰め込む
+    秒数の上限は実測に基づく既定値なので、短い範囲を潰すために破らない。§4.3-2）。
+    短い範囲はそのまま残り、隙間は `_fill_gaps` が閉じる。
     """
     if len(items) <= 1:
         return [dict(item) for item in items]
     result = [dict(item) for item in items]
     index = 0
     while index < len(result):
-        span = result[index]["end"] - result[index]["start"]
-        if span >= min_range_sec - 1e-9 or len(result) == 1:
+        current = result[index]
+        span = current["end"] - current["start"]
+        if span >= min_range_sec - _EPS or len(result) == 1:
             index += 1
             continue
 
-        if index + 1 < len(result) and (
-            result[index + 1]["start"] - result[index]["end"] < min_gap_sec - 1e-9
-        ):
+        if index + 1 < len(result):
             nxt = result[index + 1]
-            nxt["start"] = result[index]["start"]
-            nxt["priority"] = _max_priority(result[index]["priority"], nxt["priority"])
-            nxt["reasons"] = _merge_text_lists(result[index]["reasons"], nxt["reasons"])
-            nxt["titles"] = _merge_text_lists(result[index]["titles"], nxt["titles"])
-            del result[index]
-            continue  # 結合先(次の要素)を同じ index で再チェックする
+            if (
+                nxt["start"] - current["end"] < min_gap_sec - _EPS
+                and nxt["end"] - current["start"] <= max_range_sec + _EPS
+            ):
+                nxt["start"] = current["start"]
+                _absorb(nxt, current)
+                del result[index]
+                continue  # 結合先(次の要素)を同じ index で再チェックする
 
-        if index > 0 and (
-            result[index]["start"] - result[index - 1]["end"] < min_gap_sec - 1e-9
-        ):
+        if index > 0:
             prev = result[index - 1]
-            prev["end"] = result[index]["end"]
-            prev["priority"] = _max_priority(prev["priority"], result[index]["priority"])
-            prev["reasons"] = _merge_text_lists(prev["reasons"], result[index]["reasons"])
-            prev["titles"] = _merge_text_lists(prev["titles"], result[index]["titles"])
-            del result[index]
-            index -= 1
-            continue
+            if (
+                current["start"] - prev["end"] < min_gap_sec - _EPS
+                and current["end"] - prev["start"] <= max_range_sec + _EPS
+            ):
+                prev["end"] = current["end"]
+                _absorb(prev, current)
+                del result[index]
+                index -= 1
+                continue
 
-        index += 1  # 隣接する範囲が無いので短いまま残す
+        index += 1  # 隣接する範囲が無い（またはマージすると長すぎる）ので短いまま残す
     return result
+
+
+def _gap_item(start: float, end: float) -> dict[str, Any]:
+    return {
+        "start": start,
+        "end": end,
+        "priority": "low",
+        "reasons": [],
+        "titles": [],
+        "source": "gap",
+    }
 
 
 def _fill_gaps(
     items: list[dict[str, Any]], duration_sec: float, min_gap_sec: float, max_range_sec: float
 ) -> list[dict[str, Any]]:
-    def gap_item(start: float, end: float) -> dict[str, Any]:
-        return {
-            "start": start,
-            "end": end,
-            "priority": "low",
-            "reasons": [],
-            "titles": [],
-            "source": "gap",
-        }
+    """`[0, duration]` を隙間なく覆うように範囲を並べ直す。
 
+    **正の隙間は長さに関係なく必ず閉じる**（§4.3-3,4。「範囲と範囲の隙間」は動画末尾と並ぶ
+    取りこぼしの発生源なので、1 秒未満でも解析対象から外さない）。閉じ方は 2 通り:
+
+    - 隙間が `min_gap_sec` 以上: `gap_NN` として独立した範囲にする
+      （`max_range_sec` で分割し、`priority=low` を付ける）
+    - 隙間が `min_gap_sec` 未満: 直前の範囲の `end` を次の `start` まで伸ばして吸収する
+      （1 秒に満たない断片に独立した API 呼び出しを割り当てない）。
+      直前が無い（＝動画の先頭）ときは、代わりに次の範囲の `start` を 0 まで戻す。
+
+    重なりが残っている範囲（`overlap_threshold` 未満でマージされなかったもの）は、
+    後ろ側の `start` を直前の `end` まで詰めて重なりを解消する。完全に飲み込まれた範囲は
+    priority / note だけを直前の範囲に引き継いで捨てる。
+    """
     filled: list[dict[str, Any]] = []
     cursor = 0.0
     for item in items:
-        if item["start"] - cursor >= min_gap_sec - 1e-9:
-            for piece_start, piece_end in _split_span(cursor, item["start"], max_range_sec):
-                filled.append(gap_item(piece_start, piece_end))
-        filled.append(dict(item))
-        cursor = max(cursor, item["end"])
-    if duration_sec - cursor >= min_gap_sec - 1e-9:
-        for piece_start, piece_end in _split_span(cursor, duration_sec, max_range_sec):
-            filled.append(gap_item(piece_start, piece_end))
+        current = dict(item)
+        gap = current["start"] - cursor
+        if gap > _EPS:
+            if gap >= min_gap_sec - _EPS:
+                for piece_start, piece_end in _split_span(cursor, current["start"], max_range_sec):
+                    filled.append(_gap_item(piece_start, piece_end))
+            elif filled:
+                filled[-1]["end"] = current["start"]  # 直前を伸ばして吸収する
+            else:
+                current["start"] = cursor  # 先頭の短い隙間は次の範囲を前に伸ばす
+        elif gap < -_EPS:
+            current["start"] = cursor  # 重なりを解消する（カバー範囲は直前が持っている）
+
+        if current["end"] - current["start"] <= _EPS:
+            if filled:  # 直前に飲み込まれた範囲。note と priority だけ引き継ぐ
+                _absorb(filled[-1], current)
+            continue
+
+        filled.append(current)
+        cursor = current["end"]
+
+    tail = duration_sec - cursor
+    if tail > _EPS:
+        if tail >= min_gap_sec - _EPS or not filled:
+            for piece_start, piece_end in _split_span(cursor, duration_sec, max_range_sec):
+                filled.append(_gap_item(piece_start, piece_end))
+        else:
+            filled[-1]["end"] = duration_sec
     return filled
 
 
 def _ensure_bounds(items: list[dict[str, Any]], duration_sec: float) -> list[dict[str, Any]]:
+    """先頭 `start == 0` / 末尾 `end == duration` を保証する（`_fill_gaps` の後の保険）。"""
     if not items:
-        return [
-            {
-                "start": 0.0,
-                "end": duration_sec,
-                "priority": "low",
-                "reasons": [],
-                "titles": [],
-                "source": "gap",
-            }
-        ]
+        return [_gap_item(0.0, duration_sec)]
     items[0]["start"] = 0.0
     items[-1]["end"] = duration_sec
     return items
@@ -545,6 +594,37 @@ def _finalize_entry(item: dict[str, Any], fps: float | None = None) -> dict[str,
     return entry
 
 
+def _verify_full_coverage(entries: list[dict[str, Any]], duration_sec: float) -> None:
+    """全区間カバーの不変条件を検証する。破れていれば `RuntimeError`（§4.3-4）。
+
+    - `ranges[0].start == 0`
+    - `ranges[-1].end == duration`
+    - `ranges[i].end == ranges[i+1].start`（隙間も重なりも無い）
+
+    ここで落とすのは、隙間に落ちた出来事を「解析したつもり」で見逃すより、
+    計画の段階で止めた方が安いから。`coverage=high-only` で範囲を捨てたときは
+    連続性が成り立たないので、呼び出し側がこの検証を飛ばす。
+    検証は丸めた後の値（実際に config に書かれる値）に対して行う。
+    """
+    if not entries:
+        raise RuntimeError("範囲計画が空です（全区間カバーの不変条件を満たしません）")
+    expected_end = round(float(duration_sec), 2)
+    if abs(float(entries[0]["start"])) > _EPS:
+        raise RuntimeError(
+            f"範囲計画の先頭が 0 から始まっていません: start={entries[0]['start']}"
+        )
+    if abs(float(entries[-1]["end"]) - expected_end) > _EPS:
+        raise RuntimeError(
+            f"範囲計画の末尾が動画長と一致しません: end={entries[-1]['end']} / duration={expected_end}"
+        )
+    for left, right in pairwise(entries):
+        if abs(float(left["end"]) - float(right["start"])) > _EPS:
+            raise RuntimeError(
+                "範囲計画が連続していません: "
+                f"{left['label']} end={left['end']} -> {right['label']} start={right['start']}"
+            )
+
+
 def plan_full_coverage(
     candidates: list[dict[str, Any]],
     duration_sec: float,
@@ -561,8 +641,13 @@ def plan_full_coverage(
     """overview の候補から、動画全体を隙間なく覆う range 計画（config 形式）を作る。
 
     手順（§4.3）: クリップ -> overlap マージ -> 長い範囲の等分割 -> 短い範囲のマージ
-    -> 隙間埋め(gap_NN) -> 先頭 start==0 / 末尾 end==duration の保証
-    -> coverage に応じた fps 付与（high-only は low を落として dropped[] に記録）。
+    -> 隙間埋め（`min_gap_sec` 以上は gap_NN、未満は直前の範囲が吸収）
+    -> 先頭 start==0 / 末尾 end==duration の保証 -> `max_range_sec` 超過の再分割
+    -> coverage に応じた fps 付与（high-only は low を落として dropped[] に記録）
+    -> 不変条件の検証（連続性。high-only で範囲を捨てたときは検証しない）。
+
+    出力の範囲は **必ず連続する**（`ranges[i].end == ranges[i+1].start`）。
+    区間の隙間は候補の取りこぼし要因なので、1 秒未満でも解析対象から外さない。
 
     `video` / `output_dir` / `summary_output` は None のまま返す（CLI が埋める）。
     """
@@ -584,10 +669,13 @@ def plan_full_coverage(
 
     merged = _merge_candidates(normalized, overlap_threshold)
     split = _split_long_items(merged, max_range_sec)
-    short_merged = _merge_short_items(split, min_range_sec, min_gap_sec)
+    short_merged = _merge_short_items(split, min_range_sec, min_gap_sec, max_range_sec)
     filled = _fill_gaps(short_merged, duration_sec, min_gap_sec, max_range_sec)
     bounded = _ensure_bounds(filled, duration_sec)
-    labeled = _assign_labels(bounded)
+    # 隙間の吸収で `max_range_sec` を超えた範囲をここで再分割する。
+    # 等分割は連続性を壊さない（分割片の end が次の片の start と一致する）。
+    resplit = _split_long_items(bounded, max_range_sec)
+    labeled = _assign_labels(resplit)
 
     kept: list[dict[str, Any]] = []
     dropped: list[dict[str, Any]] = []
@@ -603,6 +691,10 @@ def plan_full_coverage(
         else:  # high-only: 残るのは high/medium のみ
             fps = detail_fps
         kept.append(_finalize_entry(item, fps=fps))
+
+    # high-only で範囲を捨てたときは連続にならないので検証しない（§4.3-5）
+    if not dropped:
+        _verify_full_coverage(kept, duration_sec)
 
     return {
         "video": None,

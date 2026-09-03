@@ -144,6 +144,10 @@ def test_retries_once_on_bad_json(tmp_path, video, monkeypatch):
     assert "コードフェンス付きJSON" in backend.requests[1].prompt
     meta = json.loads((session / "audio" / "audio_analysis.meta.json").read_text(encoding="utf-8"))
     assert meta["retries"] == 1
+    # リトライ分の usage も合算する（合算しないと集計からトークンが抜ける）
+    assert meta["usage"]["total_tokens"] == 4400
+    record = json.loads((session / "usage.jsonl").read_text(encoding="utf-8").strip())
+    assert record["usage"]["total_tokens"] == 4400
 
 
 def test_missing_video_is_rejected(tmp_path, monkeypatch):
@@ -162,3 +166,59 @@ def test_dry_run_does_not_call_backend(tmp_path, video, monkeypatch, capsys):
     out = capsys.readouterr().out
     assert "[dry-run]" in out
     assert not (session / "audio" / "audio_analysis.json").exists()
+
+
+# --- step と --domain --------------------------------------------------------------
+
+
+def test_usage_record_has_audio_step(tmp_path, video, monkeypatch):
+    session = tmp_path / "session"
+    session.mkdir()
+    install(monkeypatch, FakeBackend([fenced(AUDIO_PAYLOAD)]))
+    assert run_audio_analysis(AudioOptions(video=str(video), session=str(session))) == 0
+
+    record = json.loads((session / "usage.jsonl").read_text(encoding="utf-8").strip())
+    assert record["name"] == "audio_analysis"
+    assert record["step"] == "audio"
+    meta = json.loads((session / "audio" / "audio_analysis.meta.json").read_text(encoding="utf-8"))
+    assert meta["step"] == "audio"
+
+
+def test_domain_is_injected_into_prompt(tmp_path, video, monkeypatch):
+    session = tmp_path / "session"
+    session.mkdir()
+    domain_path = tmp_path / "domain.json"
+    domain_path.write_text(
+        json.dumps(
+            {
+                "name": "テストドメイン",
+                "vocabulary": {"用語A": "短い電子音が鳴ること"},
+                "watchlist": ["合図の音"],
+            },
+            ensure_ascii=False,
+        ),
+        encoding="utf-8-sig",  # BOM 付きでも読める
+    )
+    backend = install(monkeypatch, FakeBackend([fenced(AUDIO_PAYLOAD)]))
+
+    options = AudioOptions(video=str(video), session=str(session), domain=str(domain_path))
+    assert run_audio_analysis(options) == 0
+
+    prompt = backend.requests[0].prompt
+    assert "テストドメイン" in prompt
+    assert "短い電子音が鳴ること" in prompt
+    assert "合図の音" in prompt
+
+
+def test_prompt_file_with_bom_is_read(tmp_path, video, monkeypatch):
+    session = tmp_path / "session"
+    session.mkdir()
+    prompt_path = tmp_path / "audio.txt"
+    prompt_path.write_text("音声の本文プロンプト", encoding="utf-8-sig")
+    backend = install(monkeypatch, FakeBackend([fenced(AUDIO_PAYLOAD)]))
+
+    options = AudioOptions(video=str(video), session=str(session), prompt=str(prompt_path))
+    assert run_audio_analysis(options) == 0
+    sent = backend.requests[0].prompt
+    assert sent.startswith("音声の本文プロンプト")
+    assert "\ufeff" not in sent

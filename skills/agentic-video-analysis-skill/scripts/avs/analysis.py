@@ -30,15 +30,22 @@ import re
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
 from avs.backends import LLMRequest, Media, MediaImage, MediaVideoClip, describe_media, get_backend
-from avs.common import format_float_for_path, probe_duration_sec, read_json, safe_slug, write_json
-from avs.cost import estimate_cost_usd, sum_usage
+from avs.common import (
+    format_float_for_path,
+    probe_duration_sec,
+    read_json,
+    read_text_utf8,
+    safe_slug,
+    write_json,
+    write_json_atomic,
+)
 from avs.prompts import (
     DEFAULT_OBJECTIVE,
+    OTHER_STEP,
     SCHEMA_PLACEHOLDER,
     api_schema,
     assemble_prompt,
@@ -47,15 +54,15 @@ from avs.prompts import (
     load_domain,
     resolve_text_arg,
     schema_for_prompt,
+    step_for_prompt,
 )
-from avs.session import Session
+from avs.session import Session, append_usage_line, build_call_meta
 
 DEFAULT_MAX_TILES_PER_CALL = 8
 DEFAULT_BACKEND = "openrouter"
 DEFAULT_CLIP_FPS = 5.0
 
 _print_lock = threading.Lock()
-_usage_lock = threading.Lock()
 _summary_lock = threading.Lock()
 
 
@@ -84,6 +91,9 @@ class AnalyzeOptions:
     api_key: str | None = None
     strict_json: bool = False
     session: str | None = None
+    # usage.jsonl / meta.json に書くステップ名。CLI 引数ではなく
+    # `run_analysis` がプロンプト名から決める（`step_for_prompt`）
+    step: str = OTHER_STEP
     force: bool = False  # --force: 既存出力があっても再解析する
     strict: bool = False  # --strict: 1件でも失敗したら終了コード1にする（既定は全件失敗のときだけ）
     # ネイティブ動画クリップ入力
@@ -234,17 +244,6 @@ def build_backend(options: AnalyzeOptions) -> Any:
 # --- 監査記録（prompt.txt / meta.json / usage.jsonl） --------------------------
 
 
-def _write_usage_line(session: str | None, record: dict[str, Any]) -> None:
-    if not session:
-        return
-    session_dir = Path(session).expanduser()
-    session_dir.mkdir(parents=True, exist_ok=True)
-    line = json.dumps(record, ensure_ascii=False) + "\n"
-    # 並列実行から追記されるのでロックで囲む
-    with _usage_lock, (session_dir / "usage.jsonl").open("a", encoding="utf-8") as handle:
-        handle.write(line)
-
-
 def _write_call_records(
     base: Path,
     part_suffix: str,
@@ -254,25 +253,21 @@ def _write_call_records(
     prompt_chars: int,
     json_retries: int,
 ) -> dict[str, Any]:
-    """meta.json を書き、--session があれば usage.jsonl に 1 行追記して meta を返す。"""
-    usage = sum_usage([response.usage for response in responses])
-    model = responses[-1].model
-    cost_usd, is_estimate = estimate_cost_usd(model, usage)
-    meta = {
-        "backend": responses[-1].backend,
-        "model": model,
-        "media": describe_media(media),
-        "usage": usage,
-        "cost_usd": cost_usd,
-        "cost_is_estimate": is_estimate,
-        "latency_sec": round(sum(response.latency_sec for response in responses), 3),
-        "retries": sum(response.retries for response in responses) + json_retries,
-        "prompt_chars": prompt_chars,
-        "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-    }
+    """meta.json を書き、--session があれば usage.jsonl に 1 行追記して meta を返す。
+
+    meta の形と `usage.jsonl` の行は `avs.session.build_call_meta` で統一している
+    （merge / audio も同じ形で書く）。`step` はプロンプト名から決まる正確な値。
+    """
+    meta = build_call_meta(
+        responses,
+        describe_media(media),
+        prompt_chars,
+        json_retries=json_retries,
+        step=options.step,
+    )
     meta_path = base.with_name(f"{base.name}{part_suffix}.meta.json")
     write_json(meta_path, meta)
-    _write_usage_line(options.session, {"name": f"{base.name}{part_suffix}", **meta})
+    append_usage_line(options.session, {"name": f"{base.name}{part_suffix}", **meta})
     return meta
 
 
@@ -720,8 +715,19 @@ def _report_failures_and_decide_exit_code(
     return 0
 
 
-def _write_back_summary(summary_path: Path, outcomes_by_manifest: dict[Path, tuple[str, str | None]]) -> None:
-    """`--summary` の batch_summary.json の results[] に analysis_status / analysis_error を書き戻す。"""
+def _write_back_summary(
+    summary_path: Path, outcomes_by_manifest: dict[Path, tuple[str, str | None, Path | None]]
+) -> None:
+    """`--summary` の batch_summary.json の results[] に解析の結果を書き戻す。
+
+    書き戻すキーは `analysis_status` / `analysis_error` / `analysis_output`。
+    `analysis_output` は実際に書いた主要出力（`--raw` のときは `.txt`、既定は `.json`）を指す
+    （`results[].output` はタイル画像のパスなので上書きしない）。
+
+    書き込みは一時ファイル + `os.replace` で原子的に行う。
+    **複数プロセスから同じ summary を更新しないこと**（同一プロセス内はロックで直列化するが、
+    プロセス間の排他はしていないので、後から書いた方の内容で上書きされる）。
+    """
     with _summary_lock:
         try:
             summary_data = read_json(summary_path)
@@ -736,26 +742,33 @@ def _write_back_summary(summary_path: Path, outcomes_by_manifest: dict[Path, tup
             outcome = outcomes_by_manifest.get(key)
             if outcome is None:
                 continue
-            status, error = outcome
+            status, error, analysis_output = outcome
             result["analysis_status"] = status
+            if analysis_output is not None:
+                result["analysis_output"] = str(analysis_output)
             if error:
                 result["analysis_error"] = error
             else:
                 result.pop("analysis_error", None)
-        write_json(summary_path, summary_data)
+        write_json_atomic(summary_path, summary_data)
     log(f"analysis status を書き戻し: {summary_path}")
 
 
 def _write_analysis_summary(
-    output_dir: Path, video: Path | None, outcomes: list[JobOutcome]
+    output_dir: Path, video: Path | None, outcomes: list[JobOutcome], expect_json: bool = True
 ) -> Path:
-    """`--ranges` 経路用: config 横に analysis_summary.json を書く（results[]{label,output,status,error?}）。"""
+    """`--ranges` 経路用: config 横に analysis_summary.json を書く（results[]{label,output,status,error?}）。
+
+    `output` は実際に書いた主要出力（`--raw` のときは `.txt`、既定は `.json`）を指す。
+    書き込みは一時ファイル + `os.replace` で原子的に行う
+    （**複数プロセスから同じ summary を更新しないこと**。排他はしていない）。
+    """
     results = []
     for job, result, error in outcomes:
         status = _job_status(result, error)
         entry: dict[str, Any] = {
             "label": job.label,
-            "output": str(job.base.with_suffix(".json")),
+            "output": str(primary_output_path(job.base, expect_json)),
             "status": status,
         }
         if error:
@@ -763,7 +776,7 @@ def _write_analysis_summary(
         results.append(entry)
     summary_path = output_dir / "analysis_summary.json"
     output_dir.mkdir(parents=True, exist_ok=True)
-    write_json(summary_path, {"video": str(video) if video else None, "results": results})
+    write_json_atomic(summary_path, {"video": str(video) if video else None, "results": results})
     log(f"analysis summary: {summary_path}")
     return summary_path
 
@@ -803,7 +816,8 @@ def run_analysis(options: AnalyzeOptions) -> int:
         raise RuntimeError("--jobs は 1 以上を指定してください")
 
     prompt_path = Path(options.prompt).expanduser().resolve()
-    prompt_body = prompt_path.read_text(encoding="utf-8").strip()
+    prompt_body = read_text_utf8(prompt_path).strip()
+    options.step = step_for_prompt(prompt_path)
     objective = resolve_text_arg(options.objective) or DEFAULT_OBJECTIVE
     context_text = resolve_text_arg(options.context)
 
@@ -843,7 +857,9 @@ def run_analysis(options: AnalyzeOptions) -> int:
 
         outcomes = _run_jobs(clip_jobs, clip_worker, options.jobs)
         if clip_jobs and not options.dry_run:
-            _write_analysis_summary(clip_jobs[0].base.parent, clip_jobs[0].video, outcomes)
+            _write_analysis_summary(
+                clip_jobs[0].base.parent, clip_jobs[0].video, outcomes, options.expect_json
+            )
         return _report_failures_and_decide_exit_code(outcomes, len(clip_jobs), options.strict)
 
     manifests = collect_manifests(options.summary, options.manifest)
@@ -885,7 +901,12 @@ def run_analysis(options: AnalyzeOptions) -> int:
     outcomes = _run_jobs(tile_jobs, tile_worker, options.jobs)
     if options.summary and not options.dry_run:
         outcomes_by_manifest = {
-            job[0]: (_job_status(result, error), error) for job, result, error in outcomes
+            job[0]: (
+                _job_status(result, error),
+                error,
+                primary_output_path(job[2], options.expect_json),
+            )
+            for job, result, error in outcomes
         }
         _write_back_summary(Path(options.summary).expanduser().resolve(), outcomes_by_manifest)
     return _report_failures_and_decide_exit_code(outcomes, len(tile_jobs), options.strict)
