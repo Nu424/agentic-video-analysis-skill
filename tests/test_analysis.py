@@ -1,6 +1,6 @@
 """avs.analysis / avs.prompts のテスト。
 
-aitool は呼ばない（チャンク分割・JSON 抽出・パート統合・プロンプト組み立てのみ）。
+実 API は呼ばない。バックエンドは `Backend` を満たすフェイクに差し替える。
 """
 
 from __future__ import annotations
@@ -11,17 +11,24 @@ from pathlib import Path
 import pytest
 
 from avs.analysis import (
+    AnalyzeOptions,
+    analyze_one,
     chunk_with_overlap,
+    collect_clip_jobs,
     collect_manifests,
     derive_basename,
     extract_json,
     merge_part_results,
     resolve_output_base,
+    run_analysis,
 )
+from avs.backends.base import LLMResponse, MediaImage, MediaVideoClip
+from avs.cost import make_usage
 from avs.prompts import (
     OBJECTIVE_PLACEHOLDER,
     apply_objective,
     assemble_prompt,
+    build_clip_context,
     build_hypothesis_block,
     build_tile_context,
     resolve_text_arg,
@@ -240,3 +247,379 @@ def test_resolve_text_arg_reads_file(tmp_path):
     path = tmp_path / "objective.txt"
     path.write_text("  ファイルの目的\n", encoding="utf-8")
     assert resolve_text_arg(str(path)) == "ファイルの目的"
+
+
+def test_build_clip_context_uses_absolute_seconds():
+    context = build_clip_context(12.0, 20.0, 5)
+    assert "12.0 秒から 20.0 秒" in context
+    assert "絶対秒" in context
+    assert "0 秒としない" in context
+    assert "5 fps" in context
+    # fps 未指定（動画全体を送る場合）は fps 行を出さない
+    assert "fps" not in build_clip_context(0.0, 10.0, None)
+
+
+# --- フェイクバックエンド -------------------------------------------------------
+
+JSON_TEXT = '```json\n{"events": [{"title": "A"}]}\n```'
+
+
+class FakeBackend:
+    """`Backend` プロトコルを満たすテスト用バックエンド。"""
+
+    name = "fake"
+    default_model = "fake-model"
+    supports_audio = False
+
+    def __init__(self, texts: list[str] | None = None, supports_video_clip: bool = False):
+        self.texts = list(texts) if texts else None
+        self.supports_video_clip = supports_video_clip
+        self.requests: list = []
+
+    def complete(self, request):
+        self.requests.append(request)
+        text = self.texts.pop(0) if self.texts else JSON_TEXT
+        return LLMResponse(
+            text=text,
+            usage=make_usage(
+                input_tokens=1000,
+                output_tokens=200,
+                total_tokens=1200,
+                cost_usd=0.002,
+                raw={"prompt_tokens": 1000},
+            ),
+            latency_sec=1.5,
+            model="fake-model",
+            backend="fake",
+            retries=1,
+        )
+
+
+def make_manifest(tmp_path: Path, tile_count: int = 2) -> Path:
+    """タイル画像と manifest.json を作る（実画像である必要はない）。"""
+    range_dir = tmp_path / "cand_a"
+    range_dir.mkdir(parents=True, exist_ok=True)
+    tiles = []
+    for index in range(tile_count):
+        filename = f"tile_{index:03d}.jpg"
+        (range_dir / filename).write_bytes(b"\xff\xd8\xffFAKE")
+        tiles.append(
+            {
+                "tile_index": index,
+                "filename": filename,
+                "path": str(range_dir / filename),
+                "start_timestamp_sec": float(index * 2),
+                "end_timestamp_sec": float(index * 2 + 1.5),
+                "start_frame": index * 4,
+                "end_frame": index * 4 + 3,
+            }
+        )
+    manifest_path = range_dir / "manifest.json"
+    manifest_path.write_text(
+        json.dumps({"extraction": {"start_sec": 0.0, "end_sec": 4.0, "fps": 2}, "tiles": tiles}),
+        encoding="utf-8",
+    )
+    return manifest_path
+
+
+def default_options(**overrides) -> AnalyzeOptions:
+    options = AnalyzeOptions(prompt="dummy.txt", jobs=1)
+    for key, value in overrides.items():
+        setattr(options, key, value)
+    return options
+
+
+# --- analyze_one（タイル経路） --------------------------------------------------
+
+
+def test_analyze_one_writes_analysis_meta_prompt_and_usage_jsonl(tmp_path):
+    manifest_path = make_manifest(tmp_path)
+    session = tmp_path / "session"
+    base = tmp_path / "cand_a_analysis"
+    backend = FakeBackend()
+    options = default_options(session=str(session))
+
+    report = analyze_one(
+        manifest_path, options, "本文", "テスト目的", None, "仮説メモ", backend, base
+    )
+
+    assert report["parts"] == 1 and report["json_failures"] == 0
+    # 画像は MediaImage として渡る
+    request = backend.requests[0]
+    assert [type(item) for item in request.media] == [MediaImage, MediaImage]
+    assert "仮説メモ" in request.prompt
+
+    assert json.loads((tmp_path / "cand_a_analysis.json").read_text(encoding="utf-8")) == {
+        "events": [{"title": "A"}]
+    }
+    assert (tmp_path / "cand_a_analysis.raw.txt").read_text(encoding="utf-8") == JSON_TEXT
+    assert (tmp_path / "cand_a_analysis.prompt.txt").read_text(encoding="utf-8") == request.prompt
+
+    meta = json.loads((tmp_path / "cand_a_analysis.meta.json").read_text(encoding="utf-8"))
+    assert meta["backend"] == "fake"
+    assert meta["model"] == "fake-model"
+    assert meta["media"] == ["tile_000.jpg", "tile_001.jpg"]
+    assert meta["usage"]["input_tokens"] == 1000
+    assert meta["cost_usd"] == 0.002
+    assert meta["cost_is_estimate"] is False
+    assert meta["latency_sec"] == 1.5
+    assert meta["retries"] == 1  # バックエンドの通信リトライ
+    assert meta["prompt_chars"] == len(request.prompt)
+    assert meta["created_at"]
+
+    lines = (session / "usage.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    assert len(lines) == 1
+    record = json.loads(lines[0])
+    assert record["name"] == "cand_a_analysis"
+    assert record["usage"] == meta["usage"]
+    assert record["cost_usd"] == meta["cost_usd"]
+
+
+def test_analyze_one_without_session_writes_no_usage_jsonl(tmp_path):
+    manifest_path = make_manifest(tmp_path)
+    analyze_one(
+        manifest_path,
+        default_options(),
+        "本文",
+        "目的",
+        None,
+        None,
+        FakeBackend(),
+        tmp_path / "cand_a_analysis",
+    )
+    assert not list(tmp_path.rglob("usage.jsonl"))
+
+
+def test_analyze_one_retries_once_on_invalid_json(tmp_path):
+    manifest_path = make_manifest(tmp_path, tile_count=1)
+    backend = FakeBackend(texts=["JSONではない", JSON_TEXT])
+    session = tmp_path / "session"
+
+    report = analyze_one(
+        manifest_path,
+        default_options(session=str(session)),
+        "本文",
+        "目的",
+        None,
+        None,
+        backend,
+        tmp_path / "cand_a_analysis",
+    )
+
+    assert report["json_failures"] == 0
+    assert len(backend.requests) == 2
+    assert "コードフェンス付きJSONのみ" in backend.requests[1].prompt
+    assert (tmp_path / "cand_a_analysis.retry.prompt.txt").exists()
+
+    meta = json.loads((tmp_path / "cand_a_analysis.meta.json").read_text(encoding="utf-8"))
+    assert meta["usage"]["input_tokens"] == 2000  # 2 回分を合算
+    assert meta["cost_usd"] == pytest.approx(0.004)
+    assert meta["retries"] == 3  # 通信リトライ 1 + 1 と JSON リトライ 1
+    # usage.jsonl は 1 パート 1 行（リトライ分は合算）
+    assert len((session / "usage.jsonl").read_text(encoding="utf-8").strip().splitlines()) == 1
+
+
+def test_analyze_one_splits_parts_and_writes_meta_per_part(tmp_path):
+    manifest_path = make_manifest(tmp_path, tile_count=3)
+    backend = FakeBackend()
+
+    report = analyze_one(
+        manifest_path,
+        default_options(max_tiles_per_call=2),
+        "本文",
+        "目的",
+        None,
+        None,
+        backend,
+        tmp_path / "cand_a_analysis",
+    )
+
+    assert report["parts"] == 2
+    assert (tmp_path / "cand_a_analysis_part00.meta.json").exists()
+    assert (tmp_path / "cand_a_analysis_part01.prompt.txt").exists()
+    merged = json.loads((tmp_path / "cand_a_analysis.json").read_text(encoding="utf-8"))
+    assert merged["_merged_from_parts"] == 2
+
+
+def test_analyze_one_raw_mode_skips_json(tmp_path):
+    manifest_path = make_manifest(tmp_path, tile_count=1)
+    analyze_one(
+        manifest_path,
+        default_options(expect_json=False),
+        "本文",
+        "目的",
+        None,
+        None,
+        FakeBackend(texts=["ただの文章"]),
+        tmp_path / "cand_a_analysis",
+    )
+    assert (tmp_path / "cand_a_analysis.txt").read_text(encoding="utf-8") == "ただの文章"
+    assert not (tmp_path / "cand_a_analysis.json").exists()
+
+
+def test_analyze_one_dry_run_does_not_call_backend(tmp_path, capsys):
+    manifest_path = make_manifest(tmp_path)
+    backend = FakeBackend()
+
+    analyze_one(
+        manifest_path,
+        default_options(dry_run=True),
+        "本文",
+        "目的",
+        None,
+        None,
+        backend,
+        tmp_path / "cand_a_analysis",
+    )
+
+    assert backend.requests == []
+    assert not (tmp_path / "cand_a_analysis.meta.json").exists()
+    out = capsys.readouterr().out
+    assert "[dry-run]" in out
+    assert "backend: fake" in out
+    assert "画像 2 枚" in out
+
+
+# --- ネイティブ動画クリップ経路（--ranges / --video） ----------------------------
+
+
+def make_ranges_config(tmp_path: Path) -> tuple[Path, Path]:
+    video = tmp_path / "video.mp4"
+    video.write_bytes(b"fake")
+    config_path = tmp_path / "ranges.json"
+    config_path.write_text(
+        json.dumps(
+            {
+                "video": str(video),
+                "output_dir": str(tmp_path / "out"),
+                "defaults": {"fps": 5, "pad": 1.0},
+                "ranges": [
+                    {"label": "cand_a", "start": 10.0, "end": 14.0, "note": "仮説A"},
+                    {"label": "cand_b", "start": 0.5, "end": 4.0, "fps": 8},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    return config_path, video
+
+
+def test_collect_clip_jobs_from_ranges_applies_pad_and_defaults(tmp_path):
+    config_path, video = make_ranges_config(tmp_path)
+    jobs = collect_clip_jobs(default_options(ranges=str(config_path)))
+
+    assert [job.label for job in jobs] == ["cand_a", "cand_b"]
+    assert jobs[0].start_sec == 9.0 and jobs[0].end_sec == 15.0  # pad 1.0
+    assert jobs[0].fps == 5 and jobs[0].note == "仮説A"
+    assert jobs[1].start_sec == 0.0  # 0 未満にはしない
+    assert jobs[1].fps == 8
+    assert jobs[0].video == video.resolve()
+    assert jobs[0].base == (tmp_path / "out" / "cand_a_analysis").resolve()
+
+
+def test_collect_clip_jobs_single_video_range(tmp_path):
+    _config, video = make_ranges_config(tmp_path)
+    jobs = collect_clip_jobs(
+        default_options(
+            video=str(video), start=48.0, end=54.0, fps=10, output_dir=str(tmp_path / "out")
+        )
+    )
+    assert len(jobs) == 1
+    assert (jobs[0].start_sec, jobs[0].end_sec, jobs[0].fps) == (48.0, 54.0, 10.0)
+    assert jobs[0].base.name == "range_48_54_analysis"
+
+
+def test_run_analysis_ranges_creates_one_clip_per_range(tmp_path, monkeypatch):
+    config_path, video = make_ranges_config(tmp_path)
+    prompt = tmp_path / "detail.txt"
+    prompt.write_text("本文", encoding="utf-8")
+    backend = FakeBackend(supports_video_clip=True)
+    monkeypatch.setattr("avs.analysis.build_backend", lambda options: backend)
+
+    options = default_options(
+        ranges=str(config_path), prompt=str(prompt), session=str(tmp_path / "session")
+    )
+    assert run_analysis(options) == 0
+
+    assert len(backend.requests) == 2
+    clips = [request.media[0] for request in backend.requests]
+    assert all(isinstance(clip, MediaVideoClip) for clip in clips)
+    assert [(clip.start_sec, clip.end_sec, clip.fps) for clip in clips] == [
+        (9.0, 15.0, 5.0),
+        (0.0, 5.0, 8.0),
+    ]
+    assert all(clip.video == video.resolve() for clip in clips)
+    assert "9.0 秒から 15.0 秒" in backend.requests[0].prompt
+
+    out = tmp_path / "out"
+    assert (out / "cand_a_analysis.json").exists()
+    assert (out / "cand_b_analysis.meta.json").exists()
+    assert (out / "cand_a_analysis.prompt.txt").exists()
+    lines = (tmp_path / "session" / "usage.jsonl").read_text(encoding="utf-8").strip().splitlines()
+    assert {json.loads(line)["name"] for line in lines} == {"cand_a_analysis", "cand_b_analysis"}
+
+
+def test_run_analysis_ranges_rejects_backend_without_video_clip(tmp_path, monkeypatch):
+    config_path, _video = make_ranges_config(tmp_path)
+    prompt = tmp_path / "detail.txt"
+    prompt.write_text("本文", encoding="utf-8")
+    monkeypatch.setattr("avs.analysis.build_backend", lambda options: FakeBackend())
+
+    with pytest.raises(RuntimeError, match="--backend gemini"):
+        run_analysis(default_options(ranges=str(config_path), prompt=str(prompt)))
+
+
+def test_run_analysis_dry_run_calls_no_api(tmp_path, monkeypatch, capsys):
+    config_path, _video = make_ranges_config(tmp_path)
+    prompt = tmp_path / "detail.txt"
+    prompt.write_text("本文", encoding="utf-8")
+    backend = FakeBackend(supports_video_clip=True)
+    monkeypatch.setattr("avs.analysis.build_backend", lambda options: backend)
+
+    assert (
+        run_analysis(default_options(ranges=str(config_path), prompt=str(prompt), dry_run=True)) == 0
+    )
+
+    assert backend.requests == []
+    assert not (tmp_path / "out").exists() or not list((tmp_path / "out").glob("*.json"))
+    out = capsys.readouterr().out
+    assert "[dry-run]" in out
+    assert "video.mp4" in out  # クリップ仕様が出る
+    assert "出力先: cand_a_analysis" in out
+
+
+def test_collect_clip_jobs_rejects_ranges_and_video_together(tmp_path):
+    config_path, video = make_ranges_config(tmp_path)
+    with pytest.raises(RuntimeError, match="同時に指定できません"):
+        collect_clip_jobs(default_options(ranges=str(config_path), video=str(video)))
+
+
+def test_collect_clip_jobs_rejects_colliding_output(tmp_path):
+    """--output は 1 件用。複数範囲を 1 ファイルに書こうとしたら止める。"""
+    config_path, video = make_ranges_config(tmp_path)
+    config = json.loads(config_path.read_text(encoding="utf-8"))
+    del config["output_dir"]  # config の output_dir が無いと --output が使われる
+    config_path.write_text(json.dumps(config), encoding="utf-8")
+    assert video.exists()
+
+    with pytest.raises(RuntimeError, match="出力先が衝突します"):
+        collect_clip_jobs(
+            default_options(ranges=str(config_path), output=str(tmp_path / "x.json"))
+        )
+
+
+def test_run_analysis_rejects_mixing_tile_and_native_inputs(tmp_path, monkeypatch):
+    config_path, _video = make_ranges_config(tmp_path)
+    prompt = tmp_path / "detail.txt"
+    prompt.write_text("本文", encoding="utf-8")
+    monkeypatch.setattr(
+        "avs.analysis.build_backend", lambda options: FakeBackend(supports_video_clip=True)
+    )
+    manifest_path = make_manifest(tmp_path)
+
+    with pytest.raises(RuntimeError, match="同時に指定できません"):
+        run_analysis(
+            default_options(
+                ranges=str(config_path), manifest=[str(manifest_path)], prompt=str(prompt)
+            )
+        )

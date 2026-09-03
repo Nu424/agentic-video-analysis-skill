@@ -1,14 +1,25 @@
 #!/usr/bin/env python
-"""タイル manifest の解析。
+"""解析本体（タイル manifest / ネイティブ動画クリップ）。
 
-1つの manifest = 原則1回の API 呼び出し（含まれる全タイルをまとめて渡す）。
-タイル数が多い場合は時系列順に1タイル重ねてチャンク分割し、複数回呼び出す。
+呼び出しは `avs.backends` のバックエンド経由で行う（aitool には依存しない）。
+
+タイル経路: 1 manifest = 原則 1 回の API 呼び出し（含まれる全タイルをまとめて渡す）。
+タイル数が多い場合は時系列順に 1 タイル重ねてチャンク分割し、複数回呼び出す。
+
+ネイティブ経路（`--ranges` / `--video --start --end`）: 1 範囲 = 1 クリップ = 1 回の呼び出し。
+動画クリップを扱えるバックエンド（gemini）でのみ使える。
 
 - `collect_manifests`: `--manifest` / `--summary` から (manifest, note) を列挙
 - `resolve_output_base`: `<name>_analysis` までの出力ベースパスを決める
 - `chunk_with_overlap`: タイルのチャンク分割
-- `analyze_one`: 1 manifest を解析（パートごとに aitool 実行 → JSON 検証 → 統合）
-- `run_analysis`: 複数 manifest の並列実行と結果集計
+- `analyze_one`: 1 manifest を解析（パートごとに呼び出し → JSON 検証 → 統合）
+- `analyze_clip`: 1 範囲をネイティブ動画クリップとして解析
+- `run_analysis`: 入力の種類を判定し、並列実行と結果集計を行う
+
+呼び出しごとに監査記録を残す:
+`<base><suffix>.prompt.txt`（送ったプロンプト）、`<base><suffix>.meta.json`
+（backend / model / メディア / usage / cost / latency / retries）、
+`--session` があれば `<session>/usage.jsonl` に 1 行追記。
 """
 
 from __future__ import annotations
@@ -16,26 +27,30 @@ from __future__ import annotations
 import dataclasses
 import json
 import re
-import shutil
-import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from avs.common import read_json, write_json
+from avs.backends import LLMRequest, Media, MediaImage, MediaVideoClip, describe_media, get_backend
+from avs.common import format_float_for_path, probe_duration_sec, read_json, write_json
+from avs.cost import estimate_cost_usd, sum_usage
 from avs.prompts import (
     DEFAULT_OBJECTIVE,
     assemble_prompt,
+    build_clip_context,
     build_tile_context,
     resolve_text_arg,
 )
 
 DEFAULT_MAX_TILES_PER_CALL = 8
-DEFAULT_MODEL = "google/gemini-3.5-flash"
+DEFAULT_BACKEND = "openrouter"
+DEFAULT_CLIP_FPS = 5.0
 
 _print_lock = threading.Lock()
+_usage_lock = threading.Lock()
 
 
 def log(message: str) -> None:
@@ -54,18 +69,30 @@ class AnalyzeOptions:
     output_dir: str | None = None
     objective: str | None = None
     context: str | None = None
-    expect_json: bool = False
+    expect_json: bool = True  # CLI は --raw で False にする
     max_tiles_per_call: int = DEFAULT_MAX_TILES_PER_CALL
     jobs: int = 1
-    model: str = DEFAULT_MODEL
-    aitool: str | None = None
+    backend: str = DEFAULT_BACKEND
+    model: str | None = None
     api_key: str | None = None
+    strict_json: bool = False
+    session: str | None = None
+    # ネイティブ動画クリップ入力
+    ranges: str | None = None
+    video: str | None = None
+    start: float | None = None
+    end: float | None = None
+    fps: float | None = None
     dry_run: bool = False
 
     @classmethod
     def from_namespace(cls, namespace: Any) -> "AnalyzeOptions":
+        values = vars(namespace)
         known = {f.name for f in dataclasses.fields(cls)}
-        return cls(**{key: value for key, value in vars(namespace).items() if key in known})
+        options = cls(**{key: value for key, value in values.items() if key in known})
+        if "raw" in values:  # --raw は expect_json の反転
+            options.expect_json = not values["raw"]
+        return options
 
 
 # --- manifest 読み込みとタイル解決 --------------------------------------------
@@ -88,45 +115,6 @@ def resolve_tile_path(manifest_dir: Path, tile: dict[str, Any]) -> Path:
     if candidate.exists():
         return candidate.resolve()
     raise RuntimeError(f"タイル画像が見つかりません: {tile.get('filename')}")
-
-
-# --- aitool 実行 --------------------------------------------------------------
-
-
-def resolve_aitool(command: str | None) -> str:
-    if command:
-        return command
-    found = shutil.which("aitool")
-    if found:
-        return found
-    raise RuntimeError(
-        "aitool が見つかりません。`uv tool install git+https://github.com/Nu424/aitool-iroiro.git` などで導入してください"
-    )
-
-
-def build_command(
-    aitool_path: str,
-    model: str,
-    prompt_text: str,
-    tile_paths: list[Path],
-    output_path: Path,
-    api_key: str | None,
-) -> list[str]:
-    command = [
-        aitool_path,
-        "recognize-image",
-        "--model",
-        model,
-        "--text",
-        prompt_text,
-        "--output",
-        str(output_path),
-    ]
-    if api_key:
-        command.extend(["--api-key", api_key])
-    for tile_path in tile_paths:
-        command.extend(["--image", str(tile_path)])
-    return command
 
 
 # --- JSON 抽出 ----------------------------------------------------------------
@@ -218,15 +206,65 @@ def merge_part_results(parsed_parts: list[Any]) -> dict[str, Any]:
     return merged
 
 
-# --- 1 manifest の解析 --------------------------------------------------------
+# --- バックエンドの生成 --------------------------------------------------------
 
 
-def _run_aitool(command: list[str], manifest_path: Path) -> None:
-    completed = subprocess.run(command, check=False)
-    if completed.returncode != 0:
-        raise RuntimeError(
-            f"aitool recognize-image に失敗しました (exit {completed.returncode}): {manifest_path}"
-        )
+def build_backend(options: AnalyzeOptions) -> Any:
+    """オプションからバックエンドを作る。
+
+    `--dry-run` では API を呼ばないので、APIキーが無くても組み立てられるように
+    ダミーキーを渡す（キー不足で dry-run が落ちると確認の役に立たない）。
+    """
+    extra: dict[str, Any] = {"strict_json": options.strict_json}
+    if options.session:
+        extra["cache_dir"] = str(Path(options.session).expanduser() / "uploads")
+    api_key = options.api_key or ("dry-run" if options.dry_run else None)
+    return get_backend(options.backend, model=options.model, api_key=api_key, **extra)
+
+
+# --- 監査記録（prompt.txt / meta.json / usage.jsonl） --------------------------
+
+
+def _write_usage_line(session: str | None, record: dict[str, Any]) -> None:
+    if not session:
+        return
+    session_dir = Path(session).expanduser()
+    session_dir.mkdir(parents=True, exist_ok=True)
+    line = json.dumps(record, ensure_ascii=False) + "\n"
+    # 並列実行から追記されるのでロックで囲む
+    with _usage_lock, (session_dir / "usage.jsonl").open("a", encoding="utf-8") as handle:
+        handle.write(line)
+
+
+def _write_call_records(
+    base: Path,
+    part_suffix: str,
+    options: AnalyzeOptions,
+    responses: list[Any],
+    media: list[Media],
+    prompt_chars: int,
+    json_retries: int,
+) -> dict[str, Any]:
+    """meta.json を書き、--session があれば usage.jsonl に 1 行追記して meta を返す。"""
+    usage = sum_usage([response.usage for response in responses])
+    model = responses[-1].model
+    cost_usd, is_estimate = estimate_cost_usd(model, usage)
+    meta = {
+        "backend": responses[-1].backend,
+        "model": model,
+        "media": describe_media(media),
+        "usage": usage,
+        "cost_usd": cost_usd,
+        "cost_is_estimate": is_estimate,
+        "latency_sec": round(sum(response.latency_sec for response in responses), 3),
+        "retries": sum(response.retries for response in responses) + json_retries,
+        "prompt_chars": prompt_chars,
+        "created_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+    }
+    meta_path = base.with_name(f"{base.name}{part_suffix}.meta.json")
+    write_json(meta_path, meta)
+    _write_usage_line(options.session, {"name": f"{base.name}{part_suffix}", **meta})
+    return meta
 
 
 def _finalize_output(
@@ -248,6 +286,75 @@ def _finalize_output(
     return parsed, True
 
 
+def _log_dry_run(
+    backend: Any,
+    options: AnalyzeOptions,
+    media: list[Media],
+    prompt_text: str,
+    base: Path,
+    part_suffix: str,
+    label: str,
+) -> None:
+    head = prompt_text[:200].replace("\n", " ")
+    clips = [item for item in media if isinstance(item, MediaVideoClip)]
+    media_desc = (
+        " / ".join(describe_media(clips)) if clips else f"画像 {len(media)} 枚"
+    )
+    log(
+        f"  [dry-run] {label}\n"
+        f"    backend: {backend.name} / model: {options.model or backend.default_model}\n"
+        f"    media: {media_desc}\n"
+        f"    prompt(先頭200字): {head}\n"
+        f"    出力先: {base.name}{part_suffix}.*"
+    )
+
+
+def _run_call(
+    backend: Any,
+    options: AnalyzeOptions,
+    base: Path,
+    part_suffix: str,
+    prompt_text: str,
+    retry_prompt: str,
+    media: list[Media],
+) -> tuple[Any | None, bool]:
+    """1 回分の呼び出し。JSON が不正なら 1 回だけリトライする。(parsed, json_ok) を返す。"""
+    ext = ".raw.txt" if options.expect_json else ".txt"
+    raw_text_path = base.with_name(f"{base.name}{part_suffix}{ext}")
+    base.with_name(f"{base.name}{part_suffix}.prompt.txt").write_text(prompt_text, encoding="utf-8")
+
+    responses = [
+        backend.complete(
+            LLMRequest(prompt=prompt_text, media=media, json_schema=None, model=options.model)
+        )
+    ]
+    raw_text_path.write_text(responses[-1].text, encoding="utf-8")
+    parsed, json_ok = _finalize_output(raw_text_path, base, part_suffix, options.expect_json)
+
+    json_retries = 0
+    if options.expect_json and not json_ok:
+        log(f"  [警告] {base.name}{part_suffix}: JSON不正。リトライします")
+        json_retries = 1
+        base.with_name(f"{base.name}{part_suffix}.retry.prompt.txt").write_text(
+            retry_prompt, encoding="utf-8"
+        )
+        responses.append(
+            backend.complete(
+                LLMRequest(prompt=retry_prompt, media=media, json_schema=None, model=options.model)
+            )
+        )
+        raw_text_path.write_text(responses[-1].text, encoding="utf-8")
+        parsed, json_ok = _finalize_output(raw_text_path, base, part_suffix, options.expect_json)
+        if not json_ok:
+            log(f"  [警告] {base.name}{part_suffix}: リトライも失敗。生テキストのみ保存し継続")
+
+    _write_call_records(base, part_suffix, options, responses, media, len(prompt_text), json_retries)
+    return parsed, json_ok
+
+
+# --- 1 manifest の解析 --------------------------------------------------------
+
+
 def analyze_one(
     manifest_path: Path,
     options: AnalyzeOptions,
@@ -255,7 +362,7 @@ def analyze_one(
     objective: str,
     context_text: str | None,
     note: str | None,
-    aitool_path: str,
+    backend: Any,
     base: Path,
 ) -> dict[str, Any]:
     manifest, manifest_dir = load_manifest(manifest_path)
@@ -285,40 +392,35 @@ def analyze_one(
 
         # 出力先: 単一パートは base 直下、複数パートは _partNN
         part_suffix = "" if part_count == 1 else f"_part{part_index:02d}"
-        ext = ".raw.txt" if options.expect_json else ".txt"
-        raw_text_path = base.with_name(f"{base.name}{part_suffix}{ext}")
-
         prompt_text = assemble_prompt(prompt_body, objective, tile_context, context_text, note)
-        command = build_command(
-            aitool_path, options.model, prompt_text, chunk_paths, raw_text_path, options.api_key
-        )
+        media: list[Media] = [MediaImage(path=path) for path in chunk_paths]
 
         if options.dry_run:
-            log(f"  [dry-run] part {part_index + 1}/{part_count}: " + " ".join(command))
+            _log_dry_run(
+                backend,
+                options,
+                media,
+                prompt_text,
+                base,
+                part_suffix,
+                f"part {part_index + 1}/{part_count}: {manifest_path}",
+            )
             continue
 
-        _run_aitool(command, manifest_path)
-        parsed, json_ok = _finalize_output(raw_text_path, base, part_suffix, options.expect_json)
-
+        retry_prompt = assemble_prompt(
+            prompt_body, objective, tile_context, context_text, note, retry_hint=True
+        )
+        parsed, json_ok = _run_call(
+            backend, options, base, part_suffix, prompt_text, retry_prompt, media
+        )
         if options.expect_json and not json_ok:
-            # 1回だけリトライ
-            log(f"  [警告] part {part_index + 1}: JSON不正。リトライします")
-            retry_prompt = assemble_prompt(
-                prompt_body, objective, tile_context, context_text, note, retry_hint=True
-            )
-            retry_command = build_command(
-                aitool_path, options.model, retry_prompt, chunk_paths, raw_text_path, options.api_key
-            )
-            _run_aitool(retry_command, manifest_path)
-            parsed, json_ok = _finalize_output(raw_text_path, base, part_suffix, options.expect_json)
-            if not json_ok:
-                json_failures += 1
-                log(f"  [警告] part {part_index + 1}: リトライも失敗。生テキストのみ保存し継続")
-
+            json_failures += 1
         if options.expect_json and parsed is not None:
             parsed_parts.append(parsed)
-        if not options.dry_run:
-            raw_texts.append(raw_text_path.read_text(encoding="utf-8"))
+        ext = ".raw.txt" if options.expect_json else ".txt"
+        raw_texts.append(
+            base.with_name(f"{base.name}{part_suffix}{ext}").read_text(encoding="utf-8")
+        )
 
     if options.dry_run:
         return {"manifest": str(manifest_path), "json_failures": 0, "parts": part_count}
@@ -333,6 +435,153 @@ def analyze_one(
 
     log(f"[完了] {manifest_path}" + (f"  JSON失敗{json_failures}件" if json_failures else ""))
     return {"manifest": str(manifest_path), "json_failures": json_failures, "parts": part_count}
+
+
+# --- 1 範囲（ネイティブ動画クリップ）の解析 -----------------------------------
+
+
+@dataclass
+class ClipJob:
+    """ネイティブ経路の 1 範囲。"""
+
+    label: str
+    video: Path
+    start_sec: float
+    end_sec: float
+    fps: float | None
+    note: str | None
+    base: Path
+
+
+def analyze_clip(
+    job: ClipJob,
+    options: AnalyzeOptions,
+    prompt_body: str,
+    objective: str,
+    context_text: str | None,
+    backend: Any,
+) -> dict[str, Any]:
+    job.base.parent.mkdir(parents=True, exist_ok=True)
+    clip_context = build_clip_context(job.start_sec, job.end_sec, job.fps)
+    prompt_text = assemble_prompt(prompt_body, objective, clip_context, context_text, job.note)
+    media: list[Media] = [
+        MediaVideoClip(
+            video=job.video,
+            start_sec=job.start_sec,
+            end_sec=job.end_sec,
+            fps=job.fps,
+        )
+    ]
+
+    if options.dry_run:
+        _log_dry_run(backend, options, media, prompt_text, job.base, "", f"range {job.label}")
+        return {"label": job.label, "json_failures": 0, "parts": 1}
+
+    log(f"[開始] range {job.label} ({job.start_sec:.1f}s-{job.end_sec:.1f}s) -> {job.base}.*")
+    retry_prompt = assemble_prompt(
+        prompt_body, objective, clip_context, context_text, job.note, retry_hint=True
+    )
+    _, json_ok = _run_call(backend, options, job.base, "", prompt_text, retry_prompt, media)
+    json_failures = 0 if json_ok or not options.expect_json else 1
+    log(f"[完了] range {job.label}" + ("  JSON失敗1件" if json_failures else ""))
+    return {"label": job.label, "json_failures": json_failures, "parts": 1}
+
+
+def _clip_output_base(options: AnalyzeOptions, config_output_dir: str | None, label: str) -> Path:
+    if options.output_dir:
+        return (Path(options.output_dir).expanduser() / f"{label}_analysis").resolve()
+    if config_output_dir:
+        return (Path(config_output_dir).expanduser() / f"{label}_analysis").resolve()
+    if options.output:
+        return Path(options.output).expanduser().with_suffix("").resolve()
+    raise RuntimeError(
+        "出力先が決まりません。--output-dir を指定するか、config に output_dir を書いてください"
+    )
+
+
+def collect_clip_jobs(options: AnalyzeOptions) -> list[ClipJob]:
+    """`--ranges` / `--video --start --end` から解析対象のクリップを列挙する。"""
+    from avs.ranges import load_config, merge_defaults, resolve_video_path  # noqa: PLC0415
+
+    if options.ranges and options.video:
+        raise RuntimeError("--ranges と --video は同時に指定できません")
+
+    jobs: list[ClipJob] = []
+
+    if options.ranges:
+        config_path = Path(options.ranges).expanduser().resolve()
+        config = load_config(config_path)
+        video = resolve_video_path(config, config_path.parent)
+        duration = _safe_duration(video)
+        config_output_dir = config.get("output_dir")
+        for index, entry in enumerate(config["ranges"]):
+            merged = merge_defaults(config, entry)
+            if merged.get("timestamps"):
+                raise RuntimeError(
+                    "ネイティブ経路（--ranges）は timestamps 指定の zoom 範囲に対応していません"
+                )
+            pad = float(merged.get("pad", 0.0) or 0.0)
+            start = max(0.0, float(merged["start"]) - pad)
+            end = float(merged["end"]) + pad
+            if duration is not None:
+                end = min(end, duration)
+            label = str(merged.get("label") or f"range_{index:02d}")
+            jobs.append(
+                ClipJob(
+                    label=label,
+                    video=video,
+                    start_sec=start,
+                    end_sec=end,
+                    fps=float(merged.get("fps", DEFAULT_CLIP_FPS)),
+                    note=merged.get("note"),
+                    base=_clip_output_base(options, config_output_dir, label),
+                )
+            )
+        if not jobs:
+            raise RuntimeError(f"ranges が空です: {config_path}")
+        _check_output_collisions(jobs)
+        return jobs
+
+    video = Path(options.video).expanduser().resolve()
+    if not video.exists():
+        raise RuntimeError(f"動画ファイルが見つかりません: {video}")
+    duration = _safe_duration(video)
+    start = float(options.start) if options.start is not None else 0.0
+    end = float(options.end) if options.end is not None else (duration or 0.0)
+    if end <= start:
+        raise RuntimeError(f"--end は --start より大きい必要があります: {start} - {end}")
+    label = f"range_{format_float_for_path(start)}_{format_float_for_path(end)}"
+    jobs.append(
+        ClipJob(
+            label=label,
+            video=video,
+            start_sec=start,
+            end_sec=end,
+            fps=float(options.fps) if options.fps is not None else DEFAULT_CLIP_FPS,
+            note=None,
+            base=_clip_output_base(options, None, label),
+        )
+    )
+    return jobs
+
+
+def _check_output_collisions(jobs: list[ClipJob]) -> None:
+    seen: dict[Path, str] = {}
+    for job in jobs:
+        if job.base in seen:
+            raise RuntimeError(
+                f"出力先が衝突します: {job.base}.* （{seen[job.base]} と {job.label}）。"
+                "--output ではなく --output-dir を使うか、label を分けてください"
+            )
+        seen[job.base] = job.label
+
+
+def _safe_duration(video: Path) -> float | None:
+    """ffprobe が使えない環境でも動くように、失敗したら None を返す。"""
+    try:
+        return probe_duration_sec(video)
+    except RuntimeError:
+        return None
 
 
 # --- manifest 列挙と note の対応付け -------------------------------------------
@@ -351,7 +600,7 @@ def collect_manifests(summary: str | None, manifests: list[str] | None) -> list[
     if manifests:
         pairs.extend((Path(manifest).expanduser(), None) for manifest in manifests)
     if not pairs:
-        raise RuntimeError("--manifest または --summary を指定してください")
+        raise RuntimeError("--manifest / --summary / --ranges / --video のいずれかを指定してください")
 
     seen: set[Path] = set()
     unique: list[tuple[Path, str | None]] = []
@@ -363,7 +612,36 @@ def collect_manifests(summary: str | None, manifests: list[str] | None) -> list[
     return unique
 
 
-# --- 複数 manifest の実行 ------------------------------------------------------
+# --- 実行 ----------------------------------------------------------------------
+
+
+def _run_jobs(jobs: list[Any], worker: Any, jobs_count: int) -> int:
+    """worker を直列 or 並列で回し、JSON 失敗件数を返す。1 件でも失敗すれば例外。"""
+    failures: list[tuple[Any, str]] = []
+    json_failure_total = 0
+
+    if jobs_count == 1 or len(jobs) == 1:
+        for job in jobs:
+            try:
+                json_failure_total += worker(job)["json_failures"]
+            except Exception as error:  # noqa: BLE001 - まとめて報告するため継続
+                log(f"  失敗: {error}")
+                failures.append((job, str(error)))
+    else:
+        with ThreadPoolExecutor(max_workers=jobs_count) as executor:
+            future_map = {executor.submit(worker, job): job for job in jobs}
+            for future in as_completed(future_map):
+                try:
+                    json_failure_total += future.result()["json_failures"]
+                except Exception as error:  # noqa: BLE001
+                    log(f"  失敗: {error}")
+                    failures.append((future_map[future], str(error)))
+
+    if json_failure_total:
+        log(f"JSON検証に失敗したパート: {json_failure_total} 件（生テキストは保存済み）")
+    if failures:
+        raise RuntimeError(f"{len(failures)}/{len(jobs)} 件の解析に失敗しました")
+    return 0
 
 
 def run_analysis(options: AnalyzeOptions) -> int:
@@ -375,12 +653,36 @@ def run_analysis(options: AnalyzeOptions) -> int:
     objective = resolve_text_arg(options.objective) or DEFAULT_OBJECTIVE
     context_text = resolve_text_arg(options.context)
 
+    backend = build_backend(options)
+    native = bool(options.ranges or options.video)
+
+    if native:
+        if options.manifest or options.summary:
+            raise RuntimeError(
+                "--ranges / --video（ネイティブ動画クリップ）と --manifest / --summary（タイル）は"
+                "同時に指定できません"
+            )
+        if not backend.supports_video_clip:
+            raise RuntimeError(
+                f"{backend.name} バックエンドは動画クリップ非対応です。"
+                "--ranges / --video には --backend gemini を使ってください"
+            )
+        clip_jobs = collect_clip_jobs(options)
+        log(
+            f"範囲 件数: {len(clip_jobs)} / backend={backend.name}"
+            f" / model={options.model or backend.default_model} / jobs={options.jobs}"
+        )
+
+        def clip_worker(job: ClipJob) -> dict[str, Any]:
+            return analyze_clip(job, options, prompt_body, objective, context_text, backend)
+
+        return _run_jobs(clip_jobs, clip_worker, options.jobs)
+
     manifests = collect_manifests(options.summary, options.manifest)
     multiple = len(manifests) > 1
-    aitool_path = resolve_aitool(options.aitool) if not options.dry_run else (options.aitool or "aitool")
 
     # 出力先ベースを事前解決し、主要出力パスの衝突を検査する
-    jobs: list[tuple[Path, str | None, Path]] = []
+    tile_jobs: list[tuple[Path, str | None, Path]] = []
     primary_outputs: dict[Path, Path] = {}
     for manifest_path, note in manifests:
         base = resolve_output_base(manifest_path, options.output_dir, options.output, multiple)
@@ -389,43 +691,18 @@ def run_analysis(options: AnalyzeOptions) -> int:
                 f"出力先が衝突します: {base}.* （{manifest_path} と {primary_outputs[base]}）"
             )
         primary_outputs[base] = manifest_path
-        jobs.append((manifest_path, note, base))
+        tile_jobs.append((manifest_path, note, base))
 
-    log(f"manifest 件数: {len(jobs)} / jobs={options.jobs} / max-tiles-per-call={options.max_tiles_per_call}")
+    log(
+        f"manifest 件数: {len(tile_jobs)} / backend={backend.name}"
+        f" / model={options.model or backend.default_model}"
+        f" / jobs={options.jobs} / max-tiles-per-call={options.max_tiles_per_call}"
+    )
 
-    failures: list[tuple[Path, str]] = []
-    json_failure_total = 0
-
-    def worker(manifest_path: Path, note: str | None, base: Path) -> dict[str, Any]:
+    def tile_worker(job: tuple[Path, str | None, Path]) -> dict[str, Any]:
+        manifest_path, note, base = job
         return analyze_one(
-            manifest_path, options, prompt_body, objective, context_text, note, aitool_path, base
+            manifest_path, options, prompt_body, objective, context_text, note, backend, base
         )
 
-    if options.jobs == 1 or len(jobs) == 1:
-        for manifest_path, note, base in jobs:
-            try:
-                report = worker(manifest_path, note, base)
-                json_failure_total += report["json_failures"]
-            except Exception as error:  # noqa: BLE001 - まとめて報告するため継続
-                log(f"  失敗: {error}")
-                failures.append((manifest_path, str(error)))
-    else:
-        with ThreadPoolExecutor(max_workers=options.jobs) as executor:
-            future_map = {
-                executor.submit(worker, manifest_path, note, base): manifest_path
-                for manifest_path, note, base in jobs
-            }
-            for future in as_completed(future_map):
-                manifest_path = future_map[future]
-                try:
-                    report = future.result()
-                    json_failure_total += report["json_failures"]
-                except Exception as error:  # noqa: BLE001
-                    log(f"  失敗: {error}")
-                    failures.append((manifest_path, str(error)))
-
-    if json_failure_total:
-        log(f"JSON検証に失敗したパート: {json_failure_total} 件（生テキストは保存済み）")
-    if failures:
-        raise RuntimeError(f"{len(failures)}/{len(jobs)} 件の解析に失敗しました")
-    return 0
+    return _run_jobs(tile_jobs, tile_worker, options.jobs)

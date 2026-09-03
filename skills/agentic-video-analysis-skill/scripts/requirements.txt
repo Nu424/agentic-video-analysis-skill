@@ -1,1 +1,4 @@
 Pillow
+
+# gemini バックエンド（--backend gemini。ネイティブ動画クリップ・音声）を使うときは
+# google-genai も必要: pip install google-genai

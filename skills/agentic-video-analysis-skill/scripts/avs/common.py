@@ -8,12 +8,14 @@
 - ラベル用のタイムスタンプ整形 (`format_timestamp`)
 - フォント読み込み (`load_font`)
 - JSON 読み書き (`read_json` / `write_json`)
+- APIキーの解決 (`resolve_api_key`)
 """
 
 from __future__ import annotations
 
 import json
 import math
+import os
 import subprocess
 import sys
 from pathlib import Path
@@ -135,6 +137,73 @@ def load_font(size: int) -> ImageFont.ImageFont:
         except OSError:
             continue
     return ImageFont.load_default()
+
+
+# --- APIキーの解決 -------------------------------------------------------------
+
+# バックエンド名 -> 必要な環境変数名。エラーメッセージで対応を明示するために使う。
+BACKEND_ENV_NAMES = {
+    "openrouter": "OPENROUTER_API_KEY",
+    "gemini": "GEMINI_API_KEY",
+}
+
+
+def _parse_env_file(path: Path, env_name: str) -> str | None:
+    """`KEY=value` 形式のファイルから 1 つのキーを読む。
+
+    `export ` 接頭辞と `"value"` / `'value'` のクォートを剥がす
+    （`~/.env.global` はクォート付きで書かれていることがある）。
+    """
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    for line in lines:
+        stripped = line.strip()
+        if stripped.startswith("#"):
+            continue
+        stripped = stripped.removeprefix("export ").strip()
+        if not stripped.startswith(f"{env_name}="):
+            continue
+        value = stripped.split("=", 1)[1].strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        if value:
+            return value
+    return None
+
+
+def resolve_api_key(
+    env_name: str,
+    explicit: str | None = None,
+    backend: str | None = None,
+    required: bool = True,
+) -> str | None:
+    """APIキーを 環境変数 -> カレントの `.env` -> `~/.env.global` の順に探す。
+
+    `explicit`（CLI の --api-key）があればそれを最優先する。
+    見つからず required なら、バックエンドとキー名の対応を明示して RuntimeError。
+    """
+    if explicit:
+        return explicit
+
+    value = os.environ.get(env_name)
+    if value:
+        return value
+
+    for candidate in (Path.cwd() / ".env", Path.home() / ".env.global"):
+        if candidate.exists():
+            value = _parse_env_file(candidate, env_name)
+            if value:
+                return value
+
+    if not required:
+        return None
+    target = f"--backend {backend}" if backend else env_name
+    raise RuntimeError(
+        f"{target} には {env_name} が必要です。"
+        "環境変数、カレントディレクトリの .env、~/.env.global の順に探しましたが見つかりませんでした"
+    )
 
 
 def read_json(path: Path) -> Any:

@@ -4,7 +4,8 @@
 `assemble_prompt` が最終プロンプトを作る。構成は常にこの順:
 
 1. プロンプト本文（`{{OBJECTIVE}}` を目的で置換したもの）
-2. タイル画像の読み方 + このリクエストのタイル対応（`build_tile_context`）
+2. 入力の読み方: タイル経路は `build_tile_context`、
+   ネイティブ動画クリップ経路は `build_clip_context`
 3. 事前の仮説（`build_hypothesis_block`。config の note がある範囲のみ）
 4. 追加コンテキスト（`--context`）
 5. リトライ時のヒント
@@ -77,6 +78,26 @@ def build_tile_context(
             f"(t={tile['start_timestamp_sec']:.1f}s-{tile['end_timestamp_sec']:.1f}s, "
             f"frames {tile['start_frame']}-{tile['end_frame']})"
         )
+    lines.append("")
+    return "\n".join(lines)
+
+
+def build_clip_context(start_sec: float, end_sec: float, fps: float | None) -> str:
+    """ネイティブ動画クリップ（`--ranges` / `--video --start --end`）用の短いコンテキスト。
+
+    タイル経路の `build_tile_context` に相当するもの。絶対秒で答えさせることが目的。
+    """
+    lines = [
+        "## この映像について",
+        "",
+        f"- この映像は動画全体の {start_sec:.1f} 秒から {end_sec:.1f} 秒を切り出したもの。",
+        (
+            f"- 秒数は必ず動画全体の絶対秒（{start_sec:.1f}〜{end_sec:.1f} の範囲）で書くこと。"
+            "切り出しの先頭を 0 秒としない。"
+        ),
+    ]
+    if fps is not None:
+        lines.append(f"- サンプリングは {fps} fps。")
     lines.append("")
     return "\n".join(lines)
 
