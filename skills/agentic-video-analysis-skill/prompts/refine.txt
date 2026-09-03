@@ -9,21 +9,15 @@
 3. まだ不明な点があれば残す
 
 判断方針:
-- 見えていない内容は補完しない。秒数はセルラベルの `t=<秒>s` を基準にする
+- 見えていない内容は補完しない。秒数はセルラベルの `t=<秒>s`（動画全体の絶対秒）を基準にする
 - 開始・終了の断定は確認できたフレームまで。`start_sec` / `end_sec` はその最良推定値とする
+- 開始または終了がタイル端にかかっていて詰めきれない場合は `needs_more_review` を true にし、
+  必要な余白を `suggested_pad_before_sec` / `suggested_pad_after_sec` に書く
 
 出力形式:
 - 下記スキーマに従い、コードフェンス付きJSON（```json ... ```）**のみ**を出力する。前後に文章を付けない。
 - `needs_more_review` は true / false。
 
 ```json
-{
-  "start_sec": 38.8,
-  "end_sec": 44.6,
-  "evidence": ["F3 t=38.8s で開始を確認"],
-  "suggested_pad_before_sec": 1.0,
-  "suggested_pad_after_sec": 0.5,
-  "needs_more_review": false,
-  "remaining_questions": []
-}
+{{SCHEMA}}
 ```
